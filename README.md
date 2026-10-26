@@ -95,6 +95,7 @@ Settings go in `settings.toml` beside the exe; the command line wins over it. Th
 | `--mc3-traffic-*`, `--mc3-car-cache=N` | The Cruise traffic pool. See `docs/TRAFFIC_POOL.md`. |
 | `--mc3-ps2-cars=<folder>` | Loads the PS2 version's car files (`vp_*.pck`, parts) from `<folder>`. See `docs/PS2_CARS.md`. |
 | `--mc3-car-packs=<folder>` | Adds cars from folders of loose files (lists merged, names from `strings.txt`/`.strtbl`). See `docs/CAR_PACKS.md`. |
+| `--mc3-garage-script=<file>`, `--mc3-garage-dump` | The garage shops' items, prices and states from a text script; the dump writes the game's as script. See `docs/GARAGE_SCRIPT.md`. |
 | `--mc3-freecam`, `--mc3-ai-follow` | Free camera (F7), AI spectator (F8, F9 for the next car). |
 
 The full lists are in the docs of each area. Everything not listed there is a diagnostic.
