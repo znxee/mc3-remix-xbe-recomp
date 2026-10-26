@@ -41,20 +41,35 @@ UpgradeTypesStatus = [1, 1, 1]
 UpgradeTypesPrice  = [$0.00, $0.00, $0.00]
 
 [* ms]
-TurboUpgradePrice = [$0.00, $1.00, $2.00]
+TurboUpgradeNames = [Stock_Turbo, Turbo_Stage3, Level2_Turbo]
+TurboUpgradeStatus = [4, 2, 2]
+TurboUpgradePrice = [$0.00, $37.00, $2.00]
 Names = "Default name"                  ; a plain value, not a list
+
+[strings]
+Power_Engine = Custom engine
+Turbo_Stage3 = Special turbo
+Turbo_Stage3_DESC = Turbo Level 1
+
+alias Turbo_Stage3 = Level1_Turbo
 ```
 
-* A section is `[<car> <shop>]`. `*` applies to every car; a car's own section is applied after the `*` ones, so it
+* A shop section is `[<car> <shop>]`. `*` applies to every car; a car's own section is applied after the `*` ones, so it
   wins.
 * `<Name> = [a, b, c]` sets a list; put an item in double quotes when it holds a comma. `<Name> = text` sets a plain
   value.
 * A list the script does not name stays as the movie has it. A list it names is replaced whole, so keep its `Names`,
   `Status` and `Price` the same length.
-* Items are names the game knows (a part, a level, a vinyl). The game matches the chosen name to its action, so
-  removing, reordering, repricing or moving a known item (a vinyl or rim from another car's list) works; a name the
-  game has no action for does nothing when chosen. The label shown is the string table's text for the name, so a new
-  label comes from `strings.txt` in a car pack.
+* `[strings]` assigns labels globally by case-sensitive string key, including keys already present in the game. Text
+  is UTF-8; quote it to preserve leading or trailing spaces. Invalid UTF-8 is logged and ignored. Later definitions
+  replace earlier ones; the command-line script is read first, then each pack's `garage.txt`. These labels override
+  both retail strings and pack `strings.txt`, and require `--mc3-garage-script`.
+* `alias <new name> = <existing name>` defines a case-sensitive global alias, including when written inside a section.
+  Choose a new name that the game does not already use: resolution also occurs outside the garage.
+  Give the new name a label in `[strings]`, and put it in the appropriate `Names` list with corresponding `Status` and
+  `Price` entries. Some menus also look up `<new name>_DESC`; define that key to supply a description. The target must
+  be a retail item available in that category; alias chains are not supported.
+  Later definitions win. Aliases require `--mc3-garage-script`.
 * `Status` values seen in the game's own menus: `1` on submenus, `2` on parts for sale, `4` on the stock part, `6` on
   some paint options. What each changes beyond that was not measured; a level's "Locked" comes from the game's
   progress, not from `Status`.
@@ -74,7 +89,11 @@ flash\ms_vp_eclipse_04.xbck: N statements from the script` and, with the dump, `
 
 * Icons: the shop's ring of icons is drawn by the movie by position, so reordering a list moves the labels and not the
   icons. Removing items from the end of a list keeps them in step.
-* New actions: an item name the game has no code for does nothing when chosen.
+* An item name the game has no action for needs an alias to a known item; aliases do not create new part types.
+* Adding a fourth entry to the Eclipse turbo list was not enough to make a fourth ring position appear; replacing an
+  existing entry is the supported example above. Other lists may have their own length constraints.
+* The game's installed-item check compares a retail name literally with `Names`; after reopening a list it may not
+  mark the alias as installed. Other shops and special cases have not been verified.
 * The garage's own top level (Manage Vehicles, Customize Vehicle, Buy Vehicles, Exit Garage) lives in the garage movie,
   not in the shop movies.
 

@@ -55,6 +55,7 @@ X86_EXTERN_FUNC(__imp__sub_000EA750);
 bool Mc3GarageScriptActive();  // garage_script.cpp, --mc3-garage-script
 bool Mc3GarageScriptWants(const std::string& rel);
 void Mc3GarageScriptSee(const std::string& rel, const std::string& file);
+const std::u16string* Mc3GarageString(const std::string& key);
 
 namespace {
 
@@ -524,15 +525,18 @@ bool Mc3CarPackOpen(X86Context& ctx, uint8_t* base) {
     return xbox.rfind("\\Device\\", 0) == 0;  // a stock image on D: opens the usual way
 }
 
-// txtStringTable::Get (0xEA750, ecx = table, key). For a key the game lacks it makes and keeps an entry reading
-// "!!key!!"; when a car pack names the key, that entry gets the pack's text instead (car names, descriptions).
+// txtStringTable::Get (0xEA750, ecx = table, key). Script labels override retail text; pack strings fill missing keys.
 X86_FUNC(sub_000EA750) {
     const Packs& packs = Get();
-    if (packs.Empty()) {
+    const uint32_t key = X86_MEM32(ctx.esp + 4);
+    static const bool script = Mc3DebugHasArg(L"--mc3-garage-script");
+    const std::u16string* label = script && key >= 0x10000
+                                     ? Mc3GarageString(reinterpret_cast<const char*>(base + key)) : nullptr;
+    if (packs.Empty() && !label) {
         __imp__sub_000EA750(ctx, base);
         return;
     }
-    const uint32_t table = ctx.ecx, key = X86_MEM32(ctx.esp + 4);
+    const uint32_t table = ctx.ecx;
     const uint32_t eax = ctx.eax, ecx = ctx.ecx, edx = ctx.edx, esp = ctx.esp;
     X86_PUSH32(key);
     X86_PUSH32(0);
@@ -550,10 +554,17 @@ X86_FUNC(sub_000EA750) {
         ctx.esp = esp;
     }
     ctx.eax = eax, ctx.ecx = ecx, ctx.edx = edx;
-    const std::u16string* text = found ? nullptr : packs.Text(hash);
+    const std::u16string* text = label ? label : (found ? nullptr : packs.Text(hash));
     __imp__sub_000EA750(ctx, base);
     const uint32_t entry = ctx.eax;
     if (!text || !entry) return;
+    // The hook is called on every lookup. Reuse the installed value on subsequent calls.
+    const uint32_t current = X86_MEM32(entry + 8);
+    if (current) {
+        size_t i = 0;
+        while (i < text->size() && X86_MEM16(current + uint32_t(i * 2)) == (*text)[i]) ++i;
+        if (i == text->size() && X86_MEM16(current + uint32_t(i * 2)) == 0) return;
+    }
     const uint32_t keep = ctx.eax, ecx2 = ctx.ecx, edx2 = ctx.edx, esp2 = ctx.esp;
     X86_PUSH32(uint32_t((text->size() + 1) * 2));
     X86_PUSH32(0);
