@@ -41,12 +41,21 @@ struct Converted {
 std::mutex g_mutex;
 std::map<std::wstring, Converted> g_cache;  // by host path: the same car is acquired by every variant and pool
 
-const fs::path& Folder() {
-    static const fs::path folder = [] {
-        const wchar_t* v = Mc3DebugArg(L"--mc3-ps2-cars");
-        return v && *v ? fs::path(v) : fs::path();
+}  // namespace
+
+std::vector<std::filesystem::path> Mc3CarPackVehicleFolders();  // car_packs.cpp, --mc3-car-packs
+
+namespace {
+
+// --mc3-ps2-cars, then the resources\vehicle folder of each car pack
+const std::vector<fs::path>& Folders() {
+    static const std::vector<fs::path> folders = [] {
+        std::vector<fs::path> out;
+        if (const wchar_t* v = Mc3DebugArg(L"--mc3-ps2-cars"); v && *v) out.emplace_back(v);
+        for (fs::path& p : Mc3CarPackVehicleFolders()) out.push_back(std::move(p));
+        return out;
     }();
-    return folder;
+    return folders;
 }
 
 uint32_t GuestCall(X86Context& ctx, uint8_t* base, void (*fn)(X86Context&, uint8_t*), uint32_t a0, uint32_t a1) {
@@ -60,14 +69,18 @@ uint32_t GuestCall(X86Context& ctx, uint8_t* base, void (*fn)(X86Context&, uint8
     return r;
 }
 
-// "$/resources/vehicle/vp_jetta_03/vp_jetta_03_g" -> <folder>\vp_jetta_03\vp_jetta_03_g.pck
+// "$/resources/vehicle/vp_jetta_03/vp_jetta_03_g" -> <folder>\vp_jetta_03\vp_jetta_03_g.pck, from the first folder
+// that has it
 fs::path PathFor(const char* name) {
     static const char kPrefix[] = "$/resources/vehicle/";
     if (_strnicmp(name, kPrefix, sizeof kPrefix - 1) != 0) return {};
     std::string rest(name + sizeof kPrefix - 1);
     for (char& c : rest)
         if (c == '/') c = '\\';
-    return Folder() / fs::path(rest + ".pck");
+    std::error_code ec;
+    for (const fs::path& folder : Folders())
+        if (fs::path p = folder / fs::path(rest + ".pck"); fs::is_regular_file(p, ec)) return p;
+    return {};
 }
 
 // The effects the game loaded at boot (0x1B4E30 -> 0x4FA80(index, name)): a 128-entry table at 0x500F28 of objects
@@ -112,7 +125,7 @@ const Converted* Convert(uint8_t* base, const fs::path& path, uint32_t type) {
 
 // Called first by the 0x2105F0 override (mc2_city.cpp). true when it answered the load itself.
 bool Mc3Ps2CarLoad(X86Context& ctx, uint8_t* base) {
-    if (Folder().empty()) return false;
+    if (Folders().empty()) return false;
     const uint32_t name_va = X86_MEM32(ctx.esp + 4), type = X86_MEM32(ctx.esp + 8);
     const uint32_t base_out = X86_MEM32(ctx.esp + 0xC), size_out = X86_MEM32(ctx.esp + 0x10);
     if ((type != kVehicle && type != kMesh) || name_va < 0x10000 || !base_out || !size_out) return false;

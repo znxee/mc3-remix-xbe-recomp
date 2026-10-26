@@ -1354,8 +1354,16 @@ void Mc2LaRegister(X86Context&, uint8_t* base) {
     }
 }
 
+bool Mc3CarPackOpen(X86Context& ctx, uint8_t* base);  // car_packs.cpp, --mc3-car-packs
+
 // 0x1A2280 Stream::Open(path, ...): every file the game opens.
 void Mc2LaPaths(X86Context& ctx, uint8_t* base) {
+    if (Mc3CarPackOpen(ctx, base)) {  // a car pack's file, served from the cache partition
+        g_saved_read_device = X86_MEM32(kReadDevice);
+        X86_MEM32(kReadDevice) = kRawDevice;
+        g_stream_raw_override = true;
+        return;
+    }
     if (!g_enabled) return;
     uint32_t va = X86_MEM32(ctx.esp + 4);
     if (!va) return;
