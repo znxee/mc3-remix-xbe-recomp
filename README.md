@@ -93,6 +93,7 @@ Settings go in `settings.toml` beside the exe; the command line wins over it. Th
 | `--mc3-gpu-index=N` | Which Direct3D 12 adapter, in high-performance order; the boot log lists them. |
 | `--mc3-guest-memory=128` | 128 MB guest memory instead of 64. |
 | `--mc3-traffic-*`, `--mc3-car-cache=N` | The Cruise traffic pool. See `docs/TRAFFIC_POOL.md`. |
+| `--mc3-ps2-cars=<folder>` | Loads the PS2 version's car files (`vp_*.pck`, parts) from `<folder>`. See `docs/PS2_CARS.md`. |
 | `--mc3-freecam`, `--mc3-ai-follow` | Free camera (F7), AI spectator (F8, F9 for the next car). |
 
 The full lists are in the docs of each area. Everything not listed there is a diagnostic.
