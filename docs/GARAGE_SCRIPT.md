@@ -49,15 +49,38 @@ Names = "Default name"                  ; a plain value, not a list
   wins.
 * `<Name> = [a, b, c]` sets a list; put an item in double quotes when it holds a comma. `<Name> = text` sets a plain
   value.
-* A list the script does not name stays as the movie has it. A list it names is replaced whole, so keep its `Names`,
-  `Status` and `Price` the same length.
+* A list the script does not name stays as the movie has it. A list it names is replaced whole. Keep parallel
+  entries aligned when changing `Names`, `Price`, `Brand` and `Status`. The visual shop is a special case: the game
+  behaves differently when `RimsStatus` is made very short. When `RimsStatus` is shortened, the script retains the
+  movie's unused status tail at runtime; the first entries still come from the script.
 * Items are names the game knows (a part, a level, a vinyl). The game matches the chosen name to its action, so
-  removing, reordering, repricing or moving a known item (a vinyl or rim from another car's list) works; a name the
-  game has no action for does nothing when chosen. The label shown is the string table's text for the name, so a new
-  label comes from `strings.txt` in a car pack.
-* `Status` values seen in the game's own menus: `1` on submenus, `2` on parts for sale, `4` on the stock part, `6` on
-  some paint options. What each changes beyond that was not measured; a level's "Locked" comes from the game's
-  progress, not from `Status`.
+  removing, reordering, repricing or moving a known item can work, but the game also checks progression and resource
+  availability. Test the particular item and car in game. A name the game has no action for does nothing when chosen.
+  The label shown is the string table's text for the name, so a new label comes from `strings.txt` in a car pack.
+* `Status` is not a universal unlock switch. In the tested menus `1` appeared on submenus, `2` on available items,
+  `4` on the installed stock item. `5` occurs in part lists and `6` in paint dumps, but their individual effects have
+  not been measured generally. In the tested visual rim list, changing an available rim's status from `2` to `5`
+  did not lock it: the ring still showed its price. Setting a value does not establish that a part is unlocked or
+  locked.
+
+## Shop-specific observations
+
+* Detail (`ds`): a shortened vinyl list showed its scripted prices. A vinyl from an Eclipse list could be bought and
+  rendered on an SRT4; this is evidence for that pair, not every vinyl or car.
+* Paint (`ps`): the game recalculates colour-menu status values after the init action. The script preserves explicitly
+  supplied status entries during that recalculation, so a scripted available status and price can be used together.
+  The hook leaves other game update calls unchanged. Plain values, installed-state interactions and other paint
+  submenus need separate verification.
+* Visual (`vs`): `RimsBrand` is parallel to `RimsNames` and `RimsPrice`; edit its visible entries in the same
+  order. On a Monte Carlo a full-length edited list displayed and installed an Eclipse stock rim at the script price.
+  Removing one entry still showed the tested rims and prices. A three-entry `RimsStatus` list instead showed even a
+  normally available rim as locked; retaining the original status tail restored its price. The script now appends
+  that original tail automatically. The exact point at which a shortened status list fails has not been measured.
+  Changing a rim status value alone did not override the game's availability decision in this test.
+* Performance (`ms`): the original checks below cover a reduced top-level list and a repriced upgrade. Unlocks remain
+  subject to the game's progression rules.
+
+These are observations from the specific tests, not a guarantee for all submenus, vehicles or items.
 
 ## How it works
 

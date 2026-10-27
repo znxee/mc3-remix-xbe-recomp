@@ -37,6 +37,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -381,10 +382,12 @@ struct Pending {
     std::string code;   // the movie's own actions, through ActionEnd
     std::string extra;  // sprite id, the script's statements, ActionEnd
     uint32_t guest = 0; // `extra` in guest memory, kept: pushed strings are referenced, not copied
+    std::vector<Statement> status; // explicit status arrays, in script precedence order
 };
 
 std::mutex g_mutex;
 std::vector<Pending> g_pending;
+std::string g_active_rel;
 std::atomic<bool> g_any{false};  // the interpreter runs every frame: nothing to look for until a movie is seen
 
 }  // namespace
@@ -394,7 +397,12 @@ bool Mc3GarageScriptActive() { return Get().Active(); }
 
 bool Mc3GarageScriptWants(const std::string& rel) {
     std::string shop, car;
-    return Get().Active() && ShopAndCar(rel, shop, car) && Get().Wants(shop, car);
+    if (!Get().Active() || !ShopAndCar(rel, shop, car)) return false;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_active_rel = rel;
+    }
+    return Get().Wants(shop, car);
 }
 
 // `file` is the movie the game is opening for `rel` (lowercase, relative to the assets).
@@ -410,9 +418,12 @@ void Mc3GarageScriptSee(const std::string& rel, const std::string& file) {
         LOGE("MC3GARAGE %s: %s, left as it is", rel.c_str(), error.c_str());
         return;
     }
+    // A three-entry RimsStatus list made available rims appear locked. Keep the movie's unused status
+    // tail so the scripted entries still control the visible slots without losing the original array size.
+    std::vector<Statement> original;
+    const bool decoded = Decode(file, a, original, error);
     if (Get().Dump()) {
-        std::vector<Statement> sts;
-        if (Decode(file, a, sts, error)) WriteDump(shop, car, sts);
+        if (decoded) WriteDump(shop, car, original);
         else LOGE("MC3GARAGE %s: not dumped (%s)", rel.c_str(), error.c_str());
     }
     const std::vector<const Statement*> sts = Get().For(shop, car);
@@ -421,7 +432,19 @@ void Mc3GarageScriptSee(const std::string& rel, const std::string& file) {
     p.rel = rel;
     p.code = file.substr(a.code, a.end + 1 - a.code);
     p.extra = file.substr(a.block, 2);
-    for (const Statement* st : sts) p.extra += Compile(*st);
+    for (const Statement* st : sts) {
+        Statement compiled = *st;
+        if (shop == "vs" && compiled.array && compiled.name == "RimsStatus" && decoded) {
+            for (const Statement& source : original) {
+                if (source.name != compiled.name || !source.array || source.values.size() <= compiled.values.size()) continue;
+                compiled.values.insert(compiled.values.end(), source.values.begin() + compiled.values.size(), source.values.end());
+                break;
+            }
+        }
+        p.extra += Compile(compiled);
+        if (st->array && st->name.size() >= 6 && st->name.compare(st->name.size() - 6, 6, "Status") == 0)
+            p.status.push_back(*st);
+    }
     p.extra += char(0);
     LOGE("MC3GARAGE %s: %zu statements from the script", rel.c_str(), sts.size());
     g_pending.push_back(std::move(p));
@@ -439,6 +462,7 @@ X86_FUNC(sub_00068BC0) {
         std::lock_guard<std::mutex> lock(g_mutex);
         for (Pending& p : g_pending)
             if (std::memcmp(base + data + 2, p.code.data(), p.code.size()) == 0) {
+                g_active_rel = p.rel;
                 if (!p.guest && (p.guest = mem::AllocSystem(uint32_t(p.extra.size()), 16)))
                     std::memcpy(base + p.guest, p.extra.data(), p.extra.size());
                 extra = p.guest;
@@ -454,4 +478,37 @@ X86_FUNC(sub_00068BC0) {
     ctx.ecx = extra;
     __imp__sub_00068BC0(ctx, base);
     ctx.eax = eax, ctx.esp = esp;
+}
+
+// The colour menu recalculates every Status entry on each update (0x14C180), including entries supplied by the
+// script. Preserve only explicitly scripted entries in that recalculation. Other writes, including the game's
+// installed-state update, still run normally. No matching script means the original value is untouched.
+X86_EXTERN_FUNC(__imp__sub_00139590);
+
+X86_FUNC(sub_00139590) {
+    const uint32_t sp = ctx.esp;
+    if (g_any.load(std::memory_order_relaxed) && X86_MEM32(sp) == 0x0014C2A3) {
+        const uint32_t name = X86_MEM32(sp + 4), index = X86_MEM32(sp + 8);
+        std::string key;
+        for (uint32_t i = 0; i < 128 && name >= 0x10000 && mem::IsCommitted(name + i); i++) {
+            const char c = char(base[name + i]);
+            if (!c) break;
+            key += c;
+        }
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for (const Pending& p : g_pending) {
+            if (p.rel != g_active_rel || p.rel.compare(0, 9, "flash\\ps_") != 0) continue;
+            for (auto it = p.status.rbegin(); it != p.status.rend(); ++it) {
+                if (it->name != key || index >= it->values.size()) continue;
+                const std::string& text = it->values[index];
+                char* end = nullptr;
+                const long long n = std::strtoll(text.c_str(), &end, 10);
+                if (end != text.c_str() && *end == '\0' && n >= 0 && n <= std::numeric_limits<int32_t>::max())
+                    X86_MEM32(sp + 12) = uint32_t(n);
+                break;
+            }
+            break;
+        }
+    }
+    __imp__sub_00139590(ctx, base);
 }
