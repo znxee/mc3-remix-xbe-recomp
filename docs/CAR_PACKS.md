@@ -68,6 +68,10 @@ added by packs`, and one line per file served.
 
 * A pack with no `rim.ppf` or `exhaust.ppf` still uses the retail shared pages. A config that names an index outside
   the merged list is replaced with stock index 0 and the log says so. Tires and brakes currently remain retail-only.
+* A custom rim or exhaust a pack adds renders wherever a car's configuration selects it, in Cruise and the garage
+  preview, but it is not offered as its own selectable entry in the Visual Shop. That shop lists each car's own
+  curated rim and exhaust set, so a cross-pack custom part appears only when a car's configuration already names it,
+  or when a garage script (`docs/GARAGE_SCRIPT.md`, MC3-0023) adds it to that car's list.
 * PS2 texture chunks have no direct D3D equivalent. A byte-identical texture already present in the retail PS2 prefix
   uses its paired Xbox chunk. A new texture uses a valid retail Xbox texture chunk with the same PS2 extent, preserving
   page offsets and lifecycle but not the mod texture's original pixels. The log reports exact and fallback counts.
