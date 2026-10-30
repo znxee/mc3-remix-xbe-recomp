@@ -31,8 +31,15 @@ namespace {
 
 enum Tag : uint8_t { kFree = 0, kHeader, kTyped, kGraph };
 
+// An internal container type used only by ConvertShaderModel.  It deliberately
+// cannot collide with a game resource type: page-file drwShaderModel objects
+// have no PCK header, so the public wrapper below supplies one for Converter.
+constexpr uint32_t kTypeShaderModelImage = 0x4D534432u;  // "2DSM"
+
 constexpr uint32_t kCd = 0xCDCDCDCDu;
 constexpr uint32_t kXbNan = 0x7F800001u;  // what the Xbox exporter leaves in unused float slots
+constexpr uint32_t kXbModelLodVtable = 0x005DEA34u;
+constexpr uint32_t kXbStreamedTextureVtable = 0x005DDE34u;
 
 uint32_t Rd32(const uint8_t* p) {
     uint32_t v;
@@ -449,7 +456,8 @@ std::string EffectName(const std::string& tmpl) {
 
 class Converter {
 public:
-    Converter(const std::vector<uint8_t>& f, const Effects& fx, Report& r) : in_(f), out_(in_), fx_(fx), rep_(r) {}
+    Converter(const std::vector<uint8_t>& f, const Effects& fx, Report& r)
+        : in_(f), out_(in_), fx_(fx), rep_(r), page_model_(in_.Type() == kTypeShaderModelImage) {}
 
     bool Run(std::vector<uint8_t>& body, uint32_t& base_va, uint32_t& type, std::string& err) {
         if (!in_.Valid()) {
@@ -467,6 +475,9 @@ public:
                 err = error_.empty() ? "mesh conversion failed" : error_;
                 return false;
             }
+        } else if (in_.Type() == kTypeShaderModelImage) {
+            type = kTypeShaderModelImage;
+            PpfShaderModel(0x80);
         } else {
             char b[64];
             std::snprintf(b, sizeof b, "unsupported resource type %X", in_.Type());
@@ -690,6 +701,43 @@ private:
         BonyData(in_.Ptr(o + 0x80));
     }
 
+    // The shared wheel/exhaust PPF entries serialize drwShaderModel directly.
+    // Its three model pointers are rmcModel LOD tables, not the drwLod form
+    // used by a vehicle's shader model: each table starts with u16 count at
+    // +2 and a rmcModelGeom* array at +8.  Treating those as drwLod makes the
+    // name at the start of the table look like a bogus type byte and skips all
+    // geometry.  This is intentionally a separate walker: ordinary vehicle
+    // resources still use ShaderModel() above.
+    void PpfShaderModel(uint32_t o) {
+        if (!o || !seen_.insert(o).second) return;
+        Typed(o, 0x1C);
+        // PPF wheel/exhaust pages serialize the PS2 drwShaderModel vptr.  The
+        // surrounding loader relocates the data pointers, but cannot turn a
+        // PS2 dispatch target into the Xbox class vtable.  Retail Xbox wheel
+        // and exhaust pages use this root vtable for the same object.
+        out_.W32(o, 0x00608EC4u);
+        ShaderGroup(in_.Ptr(o + 8));
+        for (uint32_t k : {0x10u, 0x14u, 0x18u}) PpfModelLod(in_.Ptr(o + k));
+    }
+
+    void PpfModelLod(uint32_t o) {
+        if (!o || !seen_.insert(o).second) return;
+        Typed(o, 0xC);
+        const uint32_t n = in_.U16(o + 2), meshes = in_.Ptr(o + 8);
+        if (!meshes || n == 0 || n > 32 || !in_.Has(meshes, n * 4)) {
+            Note("PPF model LOD has no valid mesh table");
+            return;
+        }
+        // GCC serializes the non-polymorphic count word before the vptr;
+        // MSVC puts the vptr first.  The page loader relocates pointers but
+        // does not run a constructor for this embedded rmcModel table.
+        out_.W32(o, kXbModelLodVtable);
+        out_.W32(o + 4, in_.U32(o));
+        Typed(meshes, n * 4);
+        Cookie(meshes, n);
+        for (uint32_t i = 0; i < n; i++) Mesh(in_.Ptr(meshes + i * 4));
+    }
+
     void Skeleton(uint32_t o) {
         if (!o || !seen_.insert(o).second) return;
         Typed(o, 0xC);
@@ -784,6 +832,8 @@ private:
         }
         const std::string tmpl = in_.Str(in_.Ptr(o + 0x28));
         const ShaderClass* cls = FindClass(type);
+        const bool xbox_unmapped = type == 1 || type == 0x2A || type == 0x20 || type == 0x24 || type == 0x2C ||
+                                     type == 0x40 || type == 0x42 || type == 0x36;
         const uint32_t ps2_size = cls ? std::max<uint32_t>(0x30, MaxPs2(*cls)) : 0x30;
         Typed(o, ps2_size);
         const uint32_t xb_size = cls ? cls->xb_size : 0x14;
@@ -804,15 +854,17 @@ private:
             if (it->first != EffectName(tmpl)) Note("no Xbox effect for '" + tmpl + "': drawn with black_matte.fx");
             effect = it->second;
         }
-        if (!cls && type != 1 && type != 0x2A && type != 0x20 && type != 0x24 && type != 0x2C && type != 0x40 &&
-            type != 0x42 && type != 0x36) {
+        if (!cls && !xbox_unmapped) {
             char b[96];
-            std::snprintf(b, sizeof b, "shader class %02X (%s): derived fields not mapped", type, tmpl.c_str());
+            std::snprintf(b, sizeof b, "shader class %02X (%s): using the generic Xbox effect shader", type,
+                          tmpl.c_str());
             Note(b);
         }
         out_.Fill(o, xb_size, 0xCD);
         out_.W32(o, 0);
-        out_.W32(o + 4, XboxShaderFlags(flags, tmpl));
+        uint32_t xbox_flags = XboxShaderFlags(flags, tmpl);
+        if (!cls && !xbox_unmapped) xbox_flags = (xbox_flags & ~0x7Fu) | 3u;
+        out_.W32(o + 4, xbox_flags);
         out_.W32(o + 8, uint32_t(effect));
         out_.W32(o + 0xC, 0);  // the effect pointer, looked up by index on load
         uint32_t params = 0;
@@ -821,8 +873,9 @@ private:
             params = out_.Alloc((n + 2) * 0x44);
             out_.Fill(params, (n + 2) * 0x44, 0xCD);
             for (uint32_t i = 0; i < n + 2; i++) {
-                out_.W32(params + i * 0x44, i < n ? 4 : 0);
-                out_.W32(params + i * 0x44 + 4, i < n ? textures[i] : 0);
+                const bool texture = i < n && !null_textures_.count(textures[i]);
+                out_.W32(params + i * 0x44, texture ? 4 : 0);
+                out_.W32(params + i * 0x44 + 4, texture ? textures[i] : 0);
             }
         }
         out_.W32(o + 0x10, params ? out_.Va(params) : 0);
@@ -890,6 +943,39 @@ private:
             char b[96];
             std::snprintf(b, sizeof b, "texture '%s': PSM %02X %ux%u not converted", name.c_str(), psm, w, h);
             Note(b);
+            if (page_model_ && in_.U32(o + 0x50)) {
+                // A PPF texture keeps its texels in a separate page chunk.
+                // PS2 stores the chunk reference at +0x4C/+0x50; the Xbox
+                // rmcTexture layout moves it to +0x10/+0x14 and keeps the
+                // dimensions inline. Convert the proxy here while the page
+                // merger converts the referenced GS chunk to an Xbox chunk.
+                const uint32_t flags = in_.U32(o + 4), chunk_offset = in_.U32(o + 0x4C);
+                const uint32_t chunk_page = in_.U32(o + 0x50), name_va = in_.U32(o + 0x78);
+                out_.Fill(o, 0xA0, 0xCD);
+                out_.Fill(o, 0x80, 0);
+                out_.W32(o, kXbStreamedTextureVtable);
+                out_.W32(o + 4, flags);
+                out_.W16(o + 8, uint16_t(w));
+                out_.W16(o + 0xA, uint16_t(h));
+                out_.W32(o + 0x10, chunk_offset);
+                out_.W32(o + 0x14, chunk_page);
+                out_.W32(o + 0x68, 0x01000001u);
+                out_.W32(o + 0x70, name_va);
+                return;
+            }
+            // A streamed PPF model's texels are another page-file chunk, not
+            // part of this object image.  Name references cannot be created
+            // during page-in because their dictionary is not active yet, so
+            // page models put a null texture directly in the converted shader
+            // parameters.  Ordinary vehicle resources keep using the name
+            // reference path supported by their loader.
+            out_.Fill(o, 0x10, 0);
+            if (page_model_) {
+                null_textures_.insert(in_.Va(o));
+            } else {
+                out_.W8(o + 4, 2);
+                out_.W32(o + 8, in_.U32(o + 0x78));
+            }
             return;
         }
         // level sizes as the GS packs them; the CLUT follows the last resident level
@@ -1016,6 +1102,15 @@ private:
                 }
                 Typed(pk, qwc * 16);
                 in_.AddPayload(pk);
+                std::vector<Vtx> streamed;
+                // Compact packets are emitted by the shared rim/exhaust PPF
+                // exporter.  Ordinary vehicle VIF data can contain the same
+                // byte pattern by chance; treating it as compact data skips
+                // its VU batches and leaves the car's body fragmented.
+                if (page_model_ && PpfPacket(in_.At(pk), qwc * 16, streamed)) {
+                    batches[g].push_back(std::move(streamed));
+                    continue;
+                }
                 Vif vif;
                 std::string err;
                 const bool ok = vif.Run(in_.At(pk), qwc * 16, [&](const VuMem& m, const std::vector<Vif::Unpack>& u) {
@@ -1123,6 +1218,80 @@ private:
         return m;
     }
 
+    // Wheel/exhaust page files use the compact VIF layout emitted by the
+    // streamed-model exporter.  It has no VU header UNPACK (the normal vehicle
+    // route below needs one), but its typed streams are stable across the
+    // retail PPFs: position V4-16, optional UV V2-32, normal V3-8 and optional
+    // diffuse V4-8.  Decode it before falling back to the full VIF interpreter.
+    static int PpfTag(const uint8_t* p, uint32_t n, uint8_t a, uint8_t b, uint8_t command, uint8_t count) {
+        for (uint32_t o = 0; o + 4 <= n; o += 4)
+            if (p[o] == a && p[o + 1] == b && p[o + 2] == count && p[o + 3] == command) return int(o);
+        return -1;
+    }
+
+    static bool PpfPacket(const uint8_t* p, uint32_t n, std::vector<Vtx>& out) {
+        // Both exporter variants use one of the two tags below for the packed
+        // signed-short position stream.  A positive count keeps coincidental
+        // byte patterns in vertex data out of this decoder.
+        int pos = -1;
+        uint8_t count = 0;
+        for (uint32_t o = 0; o + 4 <= n; o += 4) {
+            if ((p[o] == 0xEE && p[o + 1] == 0x00) || (p[o] == 0x1B && p[o + 1] == 0x02)) {
+                if (p[o + 2] && p[o + 3] == 0x69) {
+                    pos = int(o);
+                    count = p[o + 2];
+                    break;
+                }
+            }
+        }
+        if (pos < 0 || uint32_t(pos) + 4 + uint32_t(count) * 6 > n) return false;
+        const int uv = PpfTag(p, n, 0xC4, 0x00, 0x65, count) >= 0 ? PpfTag(p, n, 0xC4, 0x00, 0x65, count)
+                                                                     : PpfTag(p, n, 0xF1, 0x01, 0x65, count);
+        const int normal = PpfTag(p, n, 0x9A, 0x00, 0x6A, count) >= 0
+                               ? PpfTag(p, n, 0x9A, 0x00, 0x6A, count)
+                               : PpfTag(p, n, 0xC7, 0x01, 0x6A, count);
+        const int diffuse = PpfTag(p, n, 0x18, 0x41, 0x6E, count) >= 0
+                                ? PpfTag(p, n, 0x18, 0x41, 0x6E, count)
+                                : PpfTag(p, n, 0x45, 0x42, 0x6E, count);
+        if ((uv >= 0 && uint32_t(uv) + 4 + uint32_t(count) * 4 > n) ||
+            (normal >= 0 && uint32_t(normal) + 4 + uint32_t(count) * 3 > n) ||
+            (diffuse >= 0 && uint32_t(diffuse) + 4 + uint32_t(count) * 4 > n))
+            return false;
+        float scale = 1.f / 4096.f;
+        if (n >= 8) {
+            std::memcpy(&scale, p + 4, sizeof scale);
+            if (!(scale > 0.f && scale < 100.f)) scale = 1.f / 4096.f;
+        }
+        out.reserve(out.size() + count);
+        for (uint32_t i = 0; i < count; i++) {
+            Vtx v{};
+            const uint8_t* q = p + pos + 4 + i * 6;
+            v.pos[0] = float(int16_t(Rd16(q))) * scale;
+            v.pos[1] = float(int16_t(Rd16(q + 2))) * scale;
+            v.pos[2] = float(int16_t(Rd16(q + 4))) * scale;
+            if (uv >= 0) {
+                const uint8_t* q = p + uv + 4 + i * 4;
+                v.uv[0] = float(Rd16(q)) / 4096.f;
+                v.uv[1] = float(Rd16(q + 2)) / 4096.f;
+            }
+            if (normal >= 0) {
+                const uint8_t* q = p + normal + 4 + i * 3;
+                v.nrm[0] = float(int8_t(q[0])) / 127.f;
+                v.nrm[1] = float(int8_t(q[1])) / 127.f;
+                v.nrm[2] = float(int8_t(q[2])) / 127.f;
+                v.adc = (q[0] & 1) != 0;
+            }
+            if (diffuse >= 0) {
+                const uint8_t* q = p + diffuse + 4 + i * 4;
+                v.color = (uint32_t(q[3]) << 24) | (uint32_t(q[0]) << 16) | (uint32_t(q[1]) << 8) | q[2];
+            } else {
+                v.color = 0x80808000u;
+            }
+            out.push_back(v);
+        }
+        return true;
+    }
+
     // one MSCAL: header at H, normals H+2, uv H+0x2C, positions H+0x56, diffuse H+0x80
     void Batch(const VuMem& m, const std::vector<Vif::Unpack>& u, std::vector<std::vector<Vtx>>& out, bool& two_uv) {
         int h = -1;
@@ -1166,6 +1335,8 @@ private:
     Out out_;
     const Effects& fx_;
     Report& rep_;
+    bool page_model_ = false;
+    std::unordered_set<uint32_t> null_textures_;
     std::string error_;
     std::set<uint32_t> seen_, graph_seen_;
     std::vector<std::pair<uint32_t, bool>> graph_roots_;
@@ -1194,6 +1365,25 @@ bool Convert(const std::vector<uint8_t>& file, const Effects& effects, std::vect
     report = Report{};
     Converter c(file, effects, report);
     return c.Run(body, base_va, type, error);
+}
+
+bool ConvertShaderModel(const std::vector<uint8_t>& source, uint32_t source_base, const Effects& effects,
+                        std::vector<uint8_t>& body, Report& report, std::string& error) {
+    std::vector<uint8_t> file(0x80 + source.size());
+    std::memcpy(file.data() + 0x80, source.data(), source.size());
+    std::memcpy(file.data(), &source_base, sizeof source_base);
+    const uint32_t version = 1, size = uint32_t(source.size());
+    std::memcpy(file.data() + 4, &kTypeShaderModelImage, sizeof kTypeShaderModelImage);
+    std::memcpy(file.data() + 8, &version, sizeof version);
+    std::memcpy(file.data() + 12, &size, sizeof size);
+    uint32_t converted_base = 0, type = 0;
+    Converter c(file, effects, report);
+    if (!c.Run(body, converted_base, type, error)) return false;
+    if (converted_base != source_base || type != kTypeShaderModelImage) {
+        error = "shader-model conversion returned an inconsistent image";
+        return false;
+    }
+    return true;
 }
 
 }  // namespace ps2veh

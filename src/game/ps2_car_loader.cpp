@@ -13,6 +13,7 @@
 #include "cpu/x86_ops.h"
 #include "game/debug_tools.h"
 #include "game/ps2_vehicle.h"
+#include "kernel/memory.h"
 
 #include <cctype>
 #include <cstdint>
@@ -26,6 +27,27 @@
 #include <vector>
 
 X86_EXTERN_FUNC(sub_0020DB20);  // aligned operator new(size, alignment)
+X86_EXTERN_FUNC(__imp__sub_00269930);
+X86_FUNC(sub_00269930) {
+    // The garage constructor creates two fixed 3 MiB VehHeaps. A converted PS2
+    // _g.pck can exhaust one even with the 128 MiB guest setting, which only
+    // enlarges the main game heap. Grow only these two garage allocations for
+    // opt-in car packs, within the guest's memory budget; other VehHeap users
+    // and the stock game keep their size.
+    const uint32_t caller = X86_MEM32(ctx.esp);
+    if (Mc3DebugArg(L"--mc3-car-packs") && X86_MEM32(ctx.esp + 4) == 0x300000 &&
+        (caller == 0x150FF0 || caller == 0x151000)) {
+        // 64 MiB can reserve eight MiB for both heaps, but not ten.  The
+        // foreground loader uses the first heap, so leave the background one
+        // stock on that budget.  Larger guests retain headroom for both.
+        const uint32_t size = mem::PhysicalSize() >= 0x8000000 ? 0x800000
+                              : caller == 0x150FF0          ? 0x500000
+                                                               : 0x300000;
+        X86_MEM32(ctx.esp + 4) = size;
+        LOGE("MC3PS2CAR garage VehHeap %X: 3 -> %u MiB", caller, size >> 20);
+    }
+    __imp__sub_00269930(ctx, base);
+}
 
 namespace {
 
@@ -85,6 +107,8 @@ fs::path PathFor(const char* name) {
 
 // The effects the game loaded at boot (0x1B4E30 -> 0x4FA80(index, name)): a 128-entry table at 0x500F28 of objects
 // whose first word is their file name ("carpaint.fx"). PS2 shaders name a template; the Xbox shader keeps the index.
+// Shared page files are initialized after the game effects have loaded too.  Keep the lookup in this translation
+// unit so vehicle images and the PPF converter use exactly the same effect-index table.
 const ps2veh::Effects& Effects(uint8_t* base) {
     static ps2veh::Effects fx;
     if (!fx.empty()) return fx;
@@ -122,6 +146,10 @@ const Converted* Convert(uint8_t* base, const fs::path& path, uint32_t type) {
 }
 
 }  // namespace
+
+// The shared rim/exhaust page files have PS2 shader names too.  Their converter must use the actual index table that
+// the game's shader factory prepared, not a guessed effect number.
+const ps2veh::Effects& Mc3Ps2Effects(uint8_t* base) { return Effects(base); }
 
 // Called first by the 0x2105F0 override (mc2_city.cpp). true when it answered the load itself.
 bool Mc3Ps2CarLoad(X86Context& ctx, uint8_t* base) {

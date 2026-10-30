@@ -14,14 +14,14 @@
 // new car in the menus. Served and merged files are written under the cache partition (hdd\Z\carpacks) and opened
 // through the console's file system, the way mc2_city.cpp serves its loose files.
 //
-// What a pack cannot add yet: wheels and exhausts of its own (they live in the shared rim/exhaust packs), so a car
-// config naming one past the game's lists gets the stock one; front-end images of a new car (flash\ds_/ms_/ps_/vs_)
-// come from a stock car's.
+// A pack can extend the shared rim/exhaust PPFs too: the retail Xbox pages stay byte-for-byte first, while PS2-only
+// tail pages are converted when the game bootstraps the page file.
 
 #include "core/log.h"
 #include "cpu/x86_context.h"
 #include "cpu/x86_ops.h"
 #include "game/debug_tools.h"
+#include "game/ps2_vehicle.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
 
@@ -35,6 +35,7 @@
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <stdexcept>
 #include <set>
 #include <sstream>
 #include <string>
@@ -51,10 +52,14 @@ X86_EXTERN_FUNC(sub_000EA710);  // txtStringTable hash of a key
 X86_EXTERN_FUNC(sub_000EC580);  // hash table lookup (ecx = table, hash) -> entry or 0
 X86_EXTERN_FUNC(sub_001B3B90);  // operator new
 X86_EXTERN_FUNC(__imp__sub_000EA750);
+X86_EXTERN_FUNC(sub_00210650);  // shared vehicle page-file bootstrap (jumps to 0x212100)
+X86_EXTERN_FUNC(__imp__sub_00210650);
+X86_EXTERN_FUNC(__imp__sub_002112C0);  // page block release
 
 bool Mc3GarageScriptActive();  // garage_script.cpp, --mc3-garage-script
 bool Mc3GarageScriptWants(const std::string& rel);
 void Mc3GarageScriptSee(const std::string& rel, const std::string& file);
+const ps2veh::Effects& Mc3Ps2Effects(uint8_t* base);  // ps2_car_loader.cpp
 
 namespace {
 
@@ -63,6 +68,167 @@ namespace fs = std::filesystem;
 constexpr uint32_t kAssetManager = 0x5348B0;  // its vtbl+0x24 opens (name, extension, 0, 1) -> Stream*
 constexpr char kCache[] = "\\Device\\Harddisk0\\Partition5\\carpacks\\";
 constexpr char kFallbackCar[] = "vp_jetta_03";  // front-end images for a new car
+
+uint32_t U32(const std::vector<uint8_t>& data, size_t at) {
+    uint32_t value = 0;
+    if (at + sizeof value <= data.size()) std::memcpy(&value, data.data() + at, sizeof value);
+    return value;
+}
+
+void Put32(std::vector<uint8_t>& data, size_t at, uint32_t value) {
+    if (at + sizeof value > data.size()) throw std::runtime_error("PPF write outside page");
+    std::memcpy(data.data() + at, &value, sizeof value);
+}
+
+uint32_t Align(uint32_t value, uint32_t alignment) { return (value + alignment - 1) / alignment * alignment; }
+
+bool PpfHeader(const std::vector<uint8_t>& file, uint32_t& count) {
+    count = U32(file, 4);
+    return file.size() >= 0x10000 && !std::memcmp(file.data(), "pf05", 4) && count && 12 + size_t(count) * 4 <= 0x10000;
+}
+
+std::vector<uint8_t> PpfPage(const std::vector<uint8_t>& file, uint32_t page) {
+    const uint32_t descriptor = U32(file, 12 + size_t(page) * 4);
+    const size_t begin = size_t(descriptor & 0x7ffff) * 0x800;
+    const size_t bytes = size_t(descriptor >> 19) * 0x400;
+    if (!bytes || begin + bytes > file.size()) throw std::runtime_error("invalid PPF page descriptor");
+    return {file.begin() + begin, file.begin() + begin + bytes};
+}
+
+// A PS2 shared vehicle PPF has the same page-directory format as the Xbox file, but model pages contain PS2 VIF
+// streams.  Retain the Xbox pages that the retail lists address and replace only the PS2-only tail with converted
+// pages.  Virtual addresses in a page remain unchanged, so the game's page manager can keep its normal relocator.
+struct PpfTextureTemplates {
+    std::map<std::string, std::vector<uint8_t>> exact;
+    std::map<uint32_t, std::vector<uint8_t>> by_ps2_bytes;
+};
+
+PpfTextureTemplates TextureTemplates(const std::vector<uint8_t>& xbox, const std::vector<uint8_t>& ps2,
+                                     uint32_t retail_pages) {
+    PpfTextureTemplates result;
+    for (uint32_t page = 0; page < retail_pages; page++) {
+        const std::vector<uint8_t> ps_page = PpfPage(ps2, page), xb_page = PpfPage(xbox, page);
+        size_t ps_at = 0, xb_at = 0;
+        while (ps_at + 32 <= ps_page.size() && xb_at + 32 <= xb_page.size()) {
+            const uint32_t ps_bytes = U32(ps_page, ps_at + 12), xb_bytes = U32(xb_page, xb_at + 12);
+            if (!ps_bytes || !xb_bytes) break;
+            if (ps_bytes < 32 || xb_bytes < 32 || ps_at + ps_bytes > ps_page.size() ||
+                xb_at + xb_bytes > xb_page.size())
+                break;
+            const uint32_t ps_type = U32(ps_page, ps_at + 20), xb_type = U32(xb_page, xb_at + 20);
+            if (ps_type == 0x0Eu && (xb_type == 0x1Cu || xb_type == 0x11u) && xb_bytes <= ps_bytes) {
+                std::string key(reinterpret_cast<const char*>(ps_page.data() + ps_at), ps_bytes);
+                std::vector<uint8_t> replacement(xb_page.begin() + xb_at, xb_page.begin() + xb_at + xb_bytes);
+                result.exact.emplace(std::move(key), replacement);
+                result.by_ps2_bytes.emplace(ps_bytes, std::move(replacement));
+            }
+            ps_at += ps_bytes;
+            xb_at += xb_bytes;
+        }
+    }
+    return result;
+}
+
+std::vector<uint8_t> ConvertPpfPage(const std::vector<uint8_t>& source, const ps2veh::Effects& effects,
+                                    const PpfTextureTemplates& textures, uint32_t& converted,
+                                    uint32_t& exact_textures, uint32_t& fallback_textures) {
+    std::vector<uint8_t> output;
+    bool parsed = false;
+    for (size_t at = 0; at + 32 <= source.size();) {
+        const uint32_t bytes = U32(source, at + 12), type = U32(source, at + 20);
+        if (!bytes) break;  // directory pages are padded to 0x400
+        if (bytes < 32 || at + bytes > source.size()) throw std::runtime_error("invalid PPF chunk");
+        parsed = true;
+        if (type == 0x0Eu) {
+            // Page references encode both the page and the byte offset, so a
+            // replacement must retain the PS2 chunk's extent. Prefer a byte-
+            // identical texture seen in the retail PS2 prefix and use its
+            // paired Xbox chunk. A new mod texture has no Xbox-compressed
+            // counterpart; give it a valid retail texture of the same PS2
+            // extent rather than feeding GS data to the D3D constructor.
+            const std::string key(reinterpret_cast<const char*>(source.data() + at), bytes);
+            auto exact = textures.exact.find(key);
+            auto generic = textures.by_ps2_bytes.find(bytes);
+            if (exact == textures.exact.end() && generic == textures.by_ps2_bytes.end())
+                throw std::runtime_error("no compatible Xbox texture template for PS2 PPF chunk");
+            std::vector<uint8_t> replacement =
+                exact != textures.exact.end() ? exact->second : generic->second;
+            if (replacement.size() > bytes) throw std::runtime_error("Xbox texture template exceeds PS2 chunk");
+            replacement.resize(bytes, 0);
+            Put32(replacement, 12, bytes);
+            output.insert(output.end(), replacement.begin(), replacement.end());
+            exact != textures.exact.end() ? exact_textures++ : fallback_textures++;
+        } else if (type != 0xffff0000u) {
+            output.insert(output.end(), source.begin() + at, source.begin() + at + bytes);
+        } else {
+            std::vector<uint8_t> model(source.begin() + at + 32, source.begin() + at + bytes), xbox;
+            ps2veh::Report report;
+            std::string error;
+            if (!ps2veh::ConvertShaderModel(model, U32(source, at), effects, xbox, report, error))
+                throw std::runtime_error("PPF model conversion failed: " + error);
+            xbox.resize(Align(uint32_t(xbox.size()), 16), 0xCD);
+            const size_t here = output.size();
+            output.insert(output.end(), source.begin() + at, source.begin() + at + 32);
+            output.insert(output.end(), xbox.begin(), xbox.end());
+            Put32(output, here + 12, uint32_t(32 + xbox.size()));
+            converted++;
+        }
+        at += bytes;
+    }
+    if (!parsed) return source;
+    // The page manager uses the zero-filled tail after the final chunk while
+    // releasing a page.  Retail Xbox and PS2 PPFs both leave this padding at
+    // zero; 0xCD here is observed as a cleanup callback on page-out.
+    output.resize(std::max(0x400u, Align(uint32_t(output.size()), 0x400)), 0);
+    return output;
+}
+
+// decal.xbck is the shared vehicle catalog (resource type 0x25). Its rim and exhaust lists contain 16-byte page
+// handles, not model data. Keep the Xbox resource graph intact and append only handles that the PS2 catalog adds.
+// The last word of each handle encodes the PPF page number; the page-file merger supplies those pages separately.
+std::vector<uint8_t> ExtendSharedCatalog(const std::vector<uint8_t>& retail, const std::vector<uint8_t>& ps2) {
+    if (retail.size() < 0x100 || ps2.size() < 0x100 || U32(retail, 4) != 0x25 || U32(ps2, 4) != 0x25 ||
+        U32(retail, 8) != 1 || U32(ps2, 8) != 1 || U32(retail, 12) + 0x80 != retail.size() ||
+        U32(ps2, 12) + 0x80 != ps2.size())
+        throw std::runtime_error("incompatible shared catalog headers");
+    const uint32_t retail_base = U32(retail, 0) - 0x80, ps2_base = U32(ps2, 0) - 0x80;
+    auto offset = [](const std::vector<uint8_t>& file, uint32_t base, uint32_t va, size_t bytes) -> size_t {
+        if (va < base || size_t(va - base) + bytes > file.size())
+            throw std::runtime_error("shared catalog pointer outside file");
+        return va - base;
+    };
+    std::vector<uint8_t> out = retail;
+    for (const uint32_t field : {0x28u, 0x38u}) {  // rims, exhausts
+        const size_t xb_table = offset(retail, retail_base, U32(retail, 0x80 + field), 8);
+        const size_t ps_table = offset(ps2, ps2_base, U32(ps2, 0x80 + field), 8);
+        const uint32_t old_count = U32(retail, xb_table + 4), new_count = U32(ps2, ps_table + 4);
+        if (!old_count || old_count > new_count || new_count > 256)
+            throw std::runtime_error("incompatible rim/exhaust catalog lengths");
+        const size_t xb_entries = offset(retail, retail_base, U32(retail, xb_table), size_t(old_count) * 4);
+        const size_t ps_entries = offset(ps2, ps2_base, U32(ps2, ps_table), size_t(new_count) * 4);
+        std::vector<uint32_t> handles;
+        handles.reserve(new_count);
+        for (uint32_t i = 0; i < old_count; i++) handles.push_back(U32(retail, xb_entries + size_t(i) * 4));
+        for (uint32_t i = old_count; i < new_count; i++) {
+            const size_t source = offset(ps2, ps2_base, U32(ps2, ps_entries + size_t(i) * 4), 16);
+            if (U32(ps2, source) != 0x007AA718u || U32(ps2, source + 4) != 0)
+                throw std::runtime_error("unsupported PS2 page handle");
+            out.resize(Align(uint32_t(out.size()), 16), 0xCD);
+            const size_t target = out.size();
+            out.insert(out.end(), ps2.begin() + source, ps2.begin() + source + 16);
+            Put32(out, target, 0x00608F80u);  // Xbox shared page-handle vtable
+            handles.push_back(retail_base + uint32_t(target));
+        }
+        out.resize(Align(uint32_t(out.size()), 16), 0xCD);
+        const size_t new_entries = out.size();
+        out.resize(new_entries + size_t(new_count) * 4, 0);
+        for (uint32_t i = 0; i < new_count; i++) Put32(out, new_entries + size_t(i) * 4, handles[i]);
+        Put32(out, xb_table, retail_base + uint32_t(new_entries));
+        Put32(out, xb_table + 4, new_count);
+    }
+    Put32(out, 12, uint32_t(out.size() - 0x80));
+    return out;
+}
 
 std::string Lower(std::string s) {
     for (char& c : s) c = c == '/' ? '\\' : char(std::tolower(uint8_t(c)));
@@ -163,6 +329,9 @@ struct Pack {
 const std::set<std::string> kMerged = {
     "tune\\vehicle\\vehicle.lst",
     "tune\\progress\\unlockingrules.csv",
+    // Catalog indices select names; the PPF page is located separately.
+    "tune\\vehicle\\customdata\\customwheels.txt",
+    "tune\\vehicle\\customdata\\customexhausts.txt",
 };
 
 class Packs {
@@ -181,6 +350,16 @@ public:
                  it.increment(ec)) {
                 if (ec || !it->is_regular_file(ec)) continue;
                 std::string rel = Lower(fs::relative(it->path(), root, ec).string());
+                // rim/exhaust are shared page files rather than ordinary car resources.  Keep their source PS2 PPF
+                // around; PageFile() combines it with the corresponding retail Xbox page file when the game opens it.
+                if (rel == "resources\\vehicle\\rim.ppf" || rel == "resources\\vehicle\\exhaust.ppf") {
+                    shared_ppf_[rel] = it->path();
+                    continue;
+                }
+                if (rel == "resources\\vehicle\\decal.pck" || rel == "resources\\vehicle\\decal_g.pck") {
+                    shared_catalog_[rel] = it->path();
+                    continue;
+                }
                 if (rel.rfind("resources\\vehicle\\", 0) == 0) continue;  // the PS2 car loader's
                 p.files.emplace(rel, it->path());
             }
@@ -253,18 +432,96 @@ public:
         return out;
     }
 
+    // Return the redirected page-file *stem* for a shared PS2 resource.  The asset manager appends xbpf itself and
+    // stores this stem for later page-ins, hence both the bootstrap read and every later page read use the cache copy.
+    std::string PageFile(uint8_t* base, const std::string& rel) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const std::string source_rel = rel + ".ppf";
+        auto source = shared_ppf_.find(source_rel);
+        if (source == shared_ppf_.end()) return {};
+        if (auto done = pagefiles_.find(rel); done != pagefiles_.end()) return done->second;
+        try {
+            const std::string retail_host = kernel::ResolvePath("D:\\" + rel + ".xbpf", 0);
+            if (retail_host.empty()) throw std::runtime_error("retail xbpf is not mounted");
+            const std::vector<uint8_t> retail = Bytes(retail_host), ps2 = Bytes(source->second);
+            uint32_t retail_count = 0, ps2_count = 0;
+            if (!PpfHeader(retail, retail_count) || !PpfHeader(ps2, ps2_count) || retail_count > ps2_count)
+                throw std::runtime_error("incompatible pf05 directories");
+            std::vector<std::vector<uint8_t>> pages;
+            pages.reserve(ps2_count);
+            uint32_t converted = 0, exact_textures = 0, fallback_textures = 0;
+            const ps2veh::Effects& effects = Mc3Ps2Effects(base);
+            const PpfTextureTemplates textures = TextureTemplates(retail, ps2, retail_count);
+            for (uint32_t i = 0; i < ps2_count; i++)
+                pages.push_back(i < retail_count
+                                    ? PpfPage(retail, i)
+                                    : ConvertPpfPage(PpfPage(ps2, i), effects, textures, converted, exact_textures,
+                                                     fallback_textures));
+
+            std::vector<uint8_t> combined(0x10000, 0);
+            std::memcpy(combined.data(), "pf05", 4);
+            Put32(combined, 4, ps2_count);
+            Put32(combined, 8, std::max(U32(retail, 8), U32(ps2, 8)));
+            uint32_t cursor = 0x10000;
+            for (uint32_t i = 0; i < ps2_count; i++) {
+                cursor = Align(cursor, 0x800);
+                const uint32_t bytes = uint32_t(pages[i].size());
+                if ((bytes & 0x3ff) || cursor / 0x800 > 0x7ffff || bytes / 0x400 > 0x1fff)
+                    throw std::runtime_error("combined page exceeds pf05 descriptor range");
+                Put32(combined, 12 + size_t(i) * 4, (bytes / 0x400 << 19) | cursor / 0x800);
+                combined.resize(size_t(cursor) + bytes, 0xCD);
+                std::memcpy(combined.data() + cursor, pages[i].data(), bytes);
+                cursor += bytes;
+            }
+            const std::string xbox = WriteBytes(rel + ".xbpf", combined);
+            if (xbox.empty()) throw std::runtime_error("cache path is unavailable");
+            pagefiles_[rel] = xbox.substr(0, xbox.size() - 5);  // PageFile consumers name the resource without .xbpf
+            LOGE("MC3PACK shared %s: %u retail + %u PS2 pages, %u models converted, "
+                 "%u exact + %u fallback Xbox texture chunks -> %s",
+                 source_rel.c_str(), retail_count, ps2_count - retail_count, converted, exact_textures,
+                 fallback_textures, pagefiles_[rel].c_str());
+            return pagefiles_[rel];
+        } catch (const std::exception& error) {
+            LOGE("MC3PACK shared %s: not converted (%s); retail page file is used", source_rel.c_str(), error.what());
+            pagefiles_[rel] = {};
+            return {};
+        }
+    }
+
+    std::string SharedCatalog(const std::string& rel) {
+        std::string source_rel = rel;
+        source_rel.replace(source_rel.size() - 5, 5, ".pck");
+        auto source = shared_catalog_.find(source_rel);
+        if (source == shared_catalog_.end()) return {};
+        try {
+            const std::string host = kernel::ResolvePath("D:\\" + rel, 0);
+            if (host.empty()) throw std::runtime_error("retail shared catalog is not mounted");
+            const std::vector<uint8_t> extended = ExtendSharedCatalog(Bytes(host), Bytes(source->second));
+            const std::string xbox = WriteBytes(rel, extended);
+            LOGE("MC3PACK shared catalog %s: extended Xbox rim/exhaust page handles -> %s", rel.c_str(),
+                 xbox.c_str());
+            return xbox;
+        } catch (const std::exception& error) {
+            LOGE("MC3PACK shared catalog %s: not extended (%s); retail catalog is used", rel.c_str(), error.what());
+            return {};
+        }
+    }
+
     // the host file standing in for `rel`, written on first use; empty to let the game open its own
     std::string Serve(X86Context& ctx, uint8_t* base, const std::string& rel) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (auto it = served_.find(rel); it != served_.end()) return it->second;
         std::string xbox;
         if (kMerged.count(rel)) xbox = Merge(ctx, base, rel);
+        else if (rel == "resources\\vehicle\\decal.xbck" || rel == "resources\\vehicle\\decal_g.xbck")
+            xbox = SharedCatalog(rel);
         else if (rel.rfind("flash\\", 0) == 0) xbox = Flash(ctx, base, rel);
         else if (rel.rfind("fonts\\", 0) == 0) xbox.clear();  // string sources, read above, never served
         else if (const fs::path* f = Find(rel)) xbox = Copy(rel, *f);
         served_[rel] = xbox;
         return xbox;
     }
+
 
 private:
     const fs::path* Find(const std::string& rel) const {
@@ -283,12 +540,29 @@ private:
         return xbox;
     }
 
+    std::string WriteBytes(const std::string& rel, const std::vector<uint8_t>& data) {
+        const std::string xbox = kCache + rel;
+        const std::string host = kernel::ResolvePath(xbox, 0);
+        if (host.empty()) return {};
+        std::error_code ec;
+        fs::create_directories(fs::path(host).parent_path(), ec);
+        std::ofstream stream(host, std::ios::binary | std::ios::trunc);
+        stream.write(reinterpret_cast<const char*>(data.data()), std::streamsize(data.size()));
+        return stream ? xbox : std::string();
+    }
+
     static std::string Read(const fs::path& p) {
         std::ifstream f(p, std::ios::binary);
         return std::string((std::istreambuf_iterator<char>(f)), {});
     }
 
-    // a pack's own file; a car config gets wheels and exhausts the game has
+    static std::vector<uint8_t> Bytes(const fs::path& p) {
+        std::ifstream stream(p, std::ios::binary);
+        if (!stream) throw std::runtime_error("could not open source file");
+        return {(std::istreambuf_iterator<char>(stream)), {}};
+    }
+
+    // A pack's own file.  Config indices are accepted when the corresponding merged list exposes them.
     std::string Copy(const std::string& rel, const fs::path& host) {
         std::string text = Read(host);
         if (rel.size() > 7 && rel.compare(rel.size() - 7, 7, ".carcfg") == 0) text = FixCarCfg(rel, text);
@@ -325,10 +599,17 @@ private:
     }
 
     std::string Merge(X86Context& ctx, uint8_t* base, const std::string& rel) {
+        const std::string game = GameFile(ctx, base, rel);
+        return MergeGameFile(rel, game);
+    }
+
+    // Make a merged cache file from a retail copy already read through GameFile.  ReadLists uses this directly:
+    // the vehicle loader asks for its shared lists before it asks for vehicle.lst, so waiting for a second open is
+    // too late to make new config indices valid.
+    std::string MergeGameFile(const std::string& rel, const std::string& game) {
         bool any = false;
         for (const Pack& p : packs_) any |= p.files.count(rel) != 0;
         if (!any) return {};
-        const std::string game = GameFile(ctx, base, rel);
         if (game.empty()) {
             LOGE("MC3PACK %s: the game's copy could not be read; the pack's is used whole", rel.c_str());
             return Write(rel, Read(*Find(rel)));
@@ -340,6 +621,7 @@ private:
         std::string out;
         for (const std::string& l : lines) out += l + "\r\n";
         if (rel == "tune\\vehicle\\customdata\\customwheels.txt") wheels_ = Lists(out);
+        else if (rel == "tune\\vehicle\\customdata\\customexhausts.txt") exhausts_ = Lists(out);
         LOGE("MC3PACK %s: %u lines added by packs", rel.c_str(), inserted);
         return Write(rel, out);
     }
@@ -445,8 +727,11 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         if (lists_read_) return;
         lists_read_ = true;
-        for (const char* rel : {"tune\\vehicle\\customdata\\customwheels.txt", "tune\\vehicle\\customdata\\customexhausts.txt"})
-            game_lists_[rel] = GameFile(ctx, base, rel);
+        for (const char* rel : {"tune\\vehicle\\customdata\\customwheels.txt", "tune\\vehicle\\customdata\\customexhausts.txt"}) {
+            const std::string retail = GameFile(ctx, base, rel);
+            game_lists_[rel] = retail;
+            if (const std::string merged = MergeGameFile(rel, retail); !merged.empty()) served_[rel] = merged;
+        }
     }
 
     static bool Reading() { return reading_; }
@@ -468,6 +753,9 @@ private:
     std::map<std::string, std::string> served_;  // relative path -> Xbox path served ("" = the game's own)
     std::map<std::string, std::string> game_lists_;
     std::map<std::string, uint32_t> wheels_, exhausts_;
+    std::map<std::string, fs::path> shared_ppf_;  // resources\\vehicle\\{rim,exhaust}.ppf, last pack wins
+    std::map<std::string, fs::path> shared_catalog_;  // resources\\vehicle\\{decal,decal_g}.pck
+    std::map<std::string, std::string> pagefiles_;  // redirected page-file stems, including a remembered failure
     bool lists_read_ = false;
     thread_local static bool reading_;
     std::mutex mutex_;
@@ -503,6 +791,59 @@ std::vector<std::filesystem::path> Mc3CarPackVehicleFolders() { return Get().Veh
 // The packs' folders, for garage_script.cpp (a pack's garage.txt).
 std::vector<std::filesystem::path> Mc3CarPackRoots() { return Get().Roots(); }
 
+// Page files do not use Stream::Open: 0x212100 calls the asset manager directly, then retains its first argument for
+// asynchronous page-ins.  Rewrite that one bootstrap argument so the original page manager opens the generated cache
+// file for both its directory and all later pages.
+void Mc3CarPackPageFileBootstrap(X86Context& ctx, uint8_t* base) {
+    Packs& packs = Get();
+    if (packs.Empty()) return;
+    const uint32_t name_va = X86_MEM32(ctx.esp + 4);
+    if (name_va < 0x10000) return;
+    std::string rel = Lower(std::string(reinterpret_cast<const char*>(base + name_va), 260));
+    rel.resize(strnlen(rel.c_str(), rel.size()));
+    if (rel.rfind("d:\\", 0) == 0) rel.erase(0, 3);
+    if (rel.rfind("$\\", 0) == 0) rel.erase(0, 2);
+    if (const std::string pagefile = packs.PageFile(base, rel); !pagefile.empty()) {
+        X86_MEM32(ctx.esp + 4) = PathSlot(base, pagefile);
+        LOGE("MC3PACK shared bootstrap %s -> %s", rel.c_str(), pagefile.c_str());
+    }
+}
+
+X86_FUNC(sub_00210650) {
+    Mc3CarPackPageFileBootstrap(ctx, base);
+    __imp__sub_00210650(ctx, base);
+}
+
+// datPageManager releases every block in a loaded page through the size at
+// chunk+0x0C and optional callback at chunk+0x18. Runtime-built PS2 tail pages
+// can expose a final allocator block that is still 0xCD debug fill. Normalize
+// only that sentinel to the zero terminator/absent callback used by retail
+// pages; real sizes and addresses stay untouched and the original release
+// routine still owns the lifecycle.
+X86_FUNC(sub_002112C0) {
+    if (!Get().Empty()) {
+        uint32_t chunk = X86_MEM32(ctx.ecx);
+        for (uint32_t guard = 0; guard < 4096 && chunk && mem::IsCommitted(chunk) &&
+                                 mem::IsCommitted(chunk + 0x1C);
+             guard++) {
+            const uint32_t bytes = X86_MEM32(chunk + 0xC);
+            if (!bytes) break;
+            if (bytes == 0xCDCDCDCDu) {
+                LOGE("MC3PACK page release: terminated debug-fill block at %08X", chunk);
+                X86_MEM32(chunk + 0xC) = 0;
+                break;
+            }
+            if (X86_MEM32(chunk + 0x18) == 0xCDCDCDCDu) {
+                LOGE("MC3PACK page release: cleared absent callback at %08X (block %X bytes)", chunk, bytes);
+                X86_MEM32(chunk + 0x18) = 0;
+            }
+            if (bytes < 0x20 || bytes > 0x1000000u || chunk + bytes < chunk) break;
+            chunk += bytes;
+        }
+    }
+    __imp__sub_002112C0(ctx, base);
+}
+
 // Called first by Mc2LaPaths (Stream::Open, 0x1A2280). true when the path now names a file the console's file system
 // opens (the caller switches Stream::Open to that device for this call).
 bool Mc3CarPackOpen(X86Context& ctx, uint8_t* base) {
@@ -515,6 +856,11 @@ bool Mc3CarPackOpen(X86Context& ctx, uint8_t* base) {
     if (rel.rfind("d:\\", 0) == 0) rel.erase(0, 3);
     if (rel.rfind("$\\", 0) == 0) rel.erase(0, 2);
     if (rel.rfind("\\device\\", 0) == 0) return false;
+    if (const std::string pagefile = packs.PageFile(base, rel); !pagefile.empty()) {
+        X86_MEM32(ctx.esp + 4) = PathSlot(base, pagefile);
+        LOGE("MC3PACK %s -> %s", rel.c_str(), pagefile.c_str());
+        return true;
+    }
     if (rel == "tune\\vehicle\\vehicle.lst") packs.ReadLists(ctx, base);
     const std::string xbox = packs.Serve(ctx, base, rel);
     if (xbox.empty()) return false;
