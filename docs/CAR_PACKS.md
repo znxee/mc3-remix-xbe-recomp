@@ -26,6 +26,7 @@ as it ships. Only what a pack holds matters, for example for one car:
 <pack>\tune\camera\<car>_*.camtrackcs, _pov...       race cameras
 <pack>\resources\vehicle\<car>\*.pck                 the PS2 car files (converted at load time, see PS2_CARS.md)
 <pack>\resources\vehicle\rim.ppf, exhaust.ppf          optional PS2 shared wheel/exhaust page files
+<pack>\flash\{ds,ms,ps,vs}_<car>.xbck|.pck             optional shop movie (Xbox or PS2 image)
 <pack>\fonts\*.strtbl                                names and texts, read as string sources
 <pack>\strings.txt                                   names and texts, one "key = text" per line (UTF-8)
 <pack>\garage.txt                                    the garage shops' menus for its cars (docs/GARAGE_SCRIPT.md)
@@ -78,6 +79,11 @@ added by packs`, and one line per file served.
 * The compact PPF packet decoder is used only for shared rim and exhaust page models. Regular vehicle VIF streams are
   always decoded by the VIF path; treating arbitrary VIF bytes as PPF headers skips VU batches and produces missing
   vehicle panels.
+* **Front-end images** of a new car (`flash\ds_`, `ms_`, `ps_`, `vs_`): an Xbox `.xbck` in the pack is preferred. A loose
+  PS2 `.pck` with the same name is also accepted and served under the requested `.xbck` name; the native Flash resource
+  constructors relocate its relative image just as they do the Xbox one. If neither exists, the stock Jetta's is shown.
+  The loader intentionally does not unpack archive members: extract `ps.zip` and `vs.zip` from a PS2 package into
+  `flash\` first. This keeps pack loading deterministic and avoids adding an archive/decompression runtime dependency.
 * A car that is locked by its unlocking rule is locked as for any car.
 
 ## How it was checked

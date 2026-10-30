@@ -15,7 +15,8 @@
 // through the console's file system, the way mc2_city.cpp serves its loose files.
 //
 // A pack can extend the shared rim/exhaust PPFs too: the retail Xbox pages stay byte-for-byte first, while PS2-only
-// tail pages are converted when the game bootstraps the page file.
+// tail pages are converted when the game bootstraps the page file. Shop movies can be supplied as Xbox .xbck or loose
+// PS2 .pck images; the Flash constructors relocate either one from its relative base.
 
 #include "core/log.h"
 #include "cpu/x86_context.h"
@@ -631,6 +632,15 @@ private:
     std::string Flash(X86Context& ctx, uint8_t* base, const std::string& rel) {
         std::string source = rel;
         const fs::path* f = Find(rel);
+        // The game asks for .xbck even when a pack supplies its PS2 movie as .pck. Both containers carry a
+        // relative Flash base, so serve that image under the requested path and let the native constructors fix it.
+        // A supplied Xbox image remains the preferred choice when both files exist.
+        if (!f && rel.size() >= 5 && rel.compare(rel.size() - 5, 5, ".xbck") == 0) {
+            std::string pck = rel;
+            pck.replace(pck.size() - 5, 5, ".pck");
+            f = Find(pck);
+            if (f) LOGE("MC3PACK %s: using PS2 %s", rel.c_str(), pck.c_str());
+        }
         static const char* kPrefixes[] = {"flash\\ds_", "flash\\ms_", "flash\\ps_", "flash\\vs_"};
         for (const char* pre : kPrefixes) {
             const size_t n = std::strlen(pre);
