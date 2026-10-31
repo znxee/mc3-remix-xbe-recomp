@@ -69,6 +69,20 @@ added by packs`, and one line per file served.
 
 * A pack with no `rim.ppf` or `exhaust.ppf` still uses the retail shared pages. A config that names an index outside
   the merged list is replaced with stock index 0 and the log says so. Tires and brakes currently remain retail-only.
+* Converted rim and exhaust models are larger than retail ones: the Xbox vertex buffers take about 2.8 times the PS2
+  VIF data. The page manager loads each page into a fixed block (`0xF15B0` -> `0x210690(bytes, count, id)`) chosen by
+  the page file's largest page (pf05 header +8): 0x1D800 bytes for rims and 0x2800 for exhausts on the retail files.
+  A larger page overran its block, corrupting the wheel mesh (whole-screen flicker when the wheel turned at speed) and
+  what followed it (a crash in the draw or on page release). The combined file now records its real largest page
+  and, with a converted file, those two blocks grow to it (`page blocks for ...: 1D800 -> 29000` in the log; with the
+  VIP pack 5 x 0x29000 rim and 4 x 0x4000 exhaust blocks). Converted pages are padded to 0x800 bytes: the page manager
+  reads a page in 0x800-byte units and rounds the directory's size down (`0x211BD0`), so a page padded only to 0x400
+  lost its last 0x400 bytes.
+* Some PS2 mod models carry a stale skeleton pointer (`+0x68`) that points into their geometry. The PS2 ignores it,
+  but the Xbox constructor relocates the nodes it names and crashed while loading the car. Such a model gets a copy of
+  the first valid skeleton of the same page file (`N invalid skeletons replaced` in the log).
+* Vinyls are retail-only: a config whose `Vinyl` is past the game's vinyl list (`decal.xbck`, the list at +0x0C) gets
+  none, and the log says so. A profile saved before this rule may still hold the old index for that car.
 * A custom rim or exhaust a pack adds renders wherever a car's configuration selects it, in Cruise and the garage
   preview, but it is not offered as its own selectable entry in the Visual Shop. That shop lists each car's own
   curated rim and exhaust set, so a cross-pack custom part appears only when a car's configuration already names it,
@@ -119,6 +133,14 @@ Style, Front Bumper, Gloss, Visual > Exhaust Tips and Visual > Rims opened and r
 bugcheck or purchase action. Captures show the intact car, an installed stock rim and installed exhaust tips. Repros:
 `research/xbox_recomp/garage_tools/MC3-0027/vip_full_garage_vif_heap5plus3_64_20261029` and
 `research/xbox_recomp/garage_tools/MC3-0027/vip_full_garage_vif_heap8_128_20261029`.
+
+MC3-0028 drove every Arcade car of the VIP pack (63 with its unlocking rules relaxed in a test copy) in San Diego
+Cruise, holding the throttle for 14 s, then paused and went back to the menus. Before: the Golf GTI crashed in the
+draw (`0xDD480`), the Scirocco's wheels flickered over the screen, and 280Z, 240SX, 99 Eclipse, RX-8, Miura, Cobra
+Concept, R8, 3000GT, Boss 302, Ford GT and Firebird crashed while loading or returning. After the block, padding,
+skeleton and vinyl rules above, each of those cars loads, drives and returns. Still open: after the Boss 302 or the
+70 Challenger, the next race can stop at a main-heap check (`Free ... Next node no longer points back`, a 0x4080-byte
+block whose following node was zeroed); it does not occur without the pack's string tables.
 
 The selected Player 1 SRT4's Visual Shop rim list contains its own stock and retail options; it does not expose the
 VIP Focus SVT's custom rim 205. The SRT4 run therefore verifies the full pack's garage load and shop navigation, while

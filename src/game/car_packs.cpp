@@ -56,6 +56,7 @@ X86_EXTERN_FUNC(__imp__sub_000EA750);
 X86_EXTERN_FUNC(sub_00210650);  // shared vehicle page-file bootstrap (jumps to 0x212100)
 X86_EXTERN_FUNC(__imp__sub_00210650);
 X86_EXTERN_FUNC(__imp__sub_002112C0);  // page block release
+X86_EXTERN_FUNC(__imp__sub_00210690);  // page manager: add fixed blocks (bytes, count, id)
 
 bool Mc3GarageScriptActive();  // garage_script.cpp, --mc3-garage-script
 bool Mc3GarageScriptWants(const std::string& rel);
@@ -130,9 +131,26 @@ PpfTextureTemplates TextureTemplates(const std::vector<uint8_t>& xbox, const std
     return result;
 }
 
+// The first valid model skeleton of a PS2 page file, for its models whose own skeleton is invalid.
+bool PpfSkeleton(const std::vector<uint8_t>& file, uint32_t count, ps2veh::SkeletonTemplate& skeleton) {
+    for (uint32_t page = 0; page < count; page++) {
+        const std::vector<uint8_t> source = PpfPage(file, page);
+        for (size_t at = 0; at + 32 <= source.size();) {
+            const uint32_t bytes = U32(source, at + 12);
+            if (bytes < 32 || at + bytes > source.size()) break;
+            if (U32(source, at + 20) == 0xffff0000u &&
+                ps2veh::FindSkeleton({source.begin() + at + 32, source.begin() + at + bytes}, U32(source, at), skeleton))
+                return true;
+            at += bytes;
+        }
+    }
+    return false;
+}
+
 std::vector<uint8_t> ConvertPpfPage(const std::vector<uint8_t>& source, const ps2veh::Effects& effects,
-                                    const PpfTextureTemplates& textures, uint32_t& converted,
-                                    uint32_t& exact_textures, uint32_t& fallback_textures) {
+                                    const PpfTextureTemplates& textures, const ps2veh::SkeletonTemplate* skeleton,
+                                    uint32_t& converted, uint32_t& skeletons, uint32_t& exact_textures,
+                                    uint32_t& fallback_textures) {
     std::vector<uint8_t> output;
     bool parsed = false;
     for (size_t at = 0; at + 32 <= source.size();) {
@@ -165,8 +183,10 @@ std::vector<uint8_t> ConvertPpfPage(const std::vector<uint8_t>& source, const ps
             std::vector<uint8_t> model(source.begin() + at + 32, source.begin() + at + bytes), xbox;
             ps2veh::Report report;
             std::string error;
-            if (!ps2veh::ConvertShaderModel(model, U32(source, at), effects, xbox, report, error))
+            if (!ps2veh::ConvertShaderModel(model, U32(source, at), effects, xbox, report, error, skeleton))
                 throw std::runtime_error("PPF model conversion failed: " + error);
+            for (const std::string& note : report.notes)
+                if (note.find("invalid skeleton") != std::string::npos) skeletons++;
             xbox.resize(Align(uint32_t(xbox.size()), 16), 0xCD);
             const size_t here = output.size();
             output.insert(output.end(), source.begin() + at, source.begin() + at + 32);
@@ -179,8 +199,10 @@ std::vector<uint8_t> ConvertPpfPage(const std::vector<uint8_t>& source, const ps
     if (!parsed) return source;
     // The page manager uses the zero-filled tail after the final chunk while
     // releasing a page.  Retail Xbox and PS2 PPFs both leave this padding at
-    // zero; 0xCD here is observed as a cleanup callback on page-out.
-    output.resize(std::max(0x400u, Align(uint32_t(output.size()), 0x400)), 0);
+    // zero; 0xCD here is observed as a cleanup callback on page-out.  The page manager reads a page in 0x800-byte
+    // units, rounding the directory's size down (0x211BD0: size >> 19 & 0x1FFE), so a page padded only to 0x400
+    // lost its last 0x400 bytes.
+    output.resize(std::max(0x800u, Align(uint32_t(output.size()), 0x800)), 0);
     return output;
 }
 
@@ -450,19 +472,25 @@ public:
                 throw std::runtime_error("incompatible pf05 directories");
             std::vector<std::vector<uint8_t>> pages;
             pages.reserve(ps2_count);
-            uint32_t converted = 0, exact_textures = 0, fallback_textures = 0;
+            uint32_t converted = 0, skeletons = 0, exact_textures = 0, fallback_textures = 0;
             const ps2veh::Effects& effects = Mc3Ps2Effects(base);
             const PpfTextureTemplates textures = TextureTemplates(retail, ps2, retail_count);
+            ps2veh::SkeletonTemplate skeleton;
+            const bool has_skeleton = PpfSkeleton(ps2, ps2_count, skeleton);
             for (uint32_t i = 0; i < ps2_count; i++)
                 pages.push_back(i < retail_count
                                     ? PpfPage(retail, i)
-                                    : ConvertPpfPage(PpfPage(ps2, i), effects, textures, converted, exact_textures,
-                                                     fallback_textures));
+                                    : ConvertPpfPage(PpfPage(ps2, i), effects, textures,
+                                                     has_skeleton ? &skeleton : nullptr, converted, skeletons,
+                                                     exact_textures, fallback_textures));
 
             std::vector<uint8_t> combined(0x10000, 0);
             std::memcpy(combined.data(), "pf05", 4);
             Put32(combined, 4, ps2_count);
-            Put32(combined, 8, std::max(U32(retail, 8), U32(ps2, 8)));
+            // +8 is the largest page; converted PS2 models outgrow both source files' values.
+            uint32_t largest = std::max(U32(retail, 8), U32(ps2, 8));
+            for (const std::vector<uint8_t>& page : pages) largest = std::max(largest, Align(uint32_t(page.size()), 0x800));
+            Put32(combined, 8, largest);
             uint32_t cursor = 0x10000;
             for (uint32_t i = 0; i < ps2_count; i++) {
                 cursor = Align(cursor, 0x800);
@@ -477,16 +505,25 @@ public:
             const std::string xbox = WriteBytes(rel + ".xbpf", combined);
             if (xbox.empty()) throw std::runtime_error("cache path is unavailable");
             pagefiles_[rel] = xbox.substr(0, xbox.size() - 5);  // PageFile consumers name the resource without .xbpf
-            LOGE("MC3PACK shared %s: %u retail + %u PS2 pages, %u models converted, "
-                 "%u exact + %u fallback Xbox texture chunks -> %s",
-                 source_rel.c_str(), retail_count, ps2_count - retail_count, converted, exact_textures,
-                 fallback_textures, pagefiles_[rel].c_str());
+            largest_[rel] = largest;
+            LOGE("MC3PACK shared %s: %u retail + %u PS2 pages, %u models converted (%u invalid skeletons replaced), "
+                 "%u exact + %u fallback Xbox texture chunks, largest page %X -> %s",
+                 source_rel.c_str(), retail_count, ps2_count - retail_count, converted, skeletons, exact_textures,
+                 fallback_textures, largest, pagefiles_[rel].c_str());
             return pagefiles_[rel];
         } catch (const std::exception& error) {
             LOGE("MC3PACK shared %s: not converted (%s); retail page file is used", source_rel.c_str(), error.what());
             pagefiles_[rel] = {};
             return {};
         }
+    }
+
+    // The largest page of a shared page file a pack converts (generating it now), 0 when the retail file is used.
+    uint32_t LargestPage(uint8_t* base, const std::string& rel) {
+        if (PageFile(base, rel).empty()) return 0;
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = largest_.find(rel);
+        return it == largest_.end() ? 0 : it->second;
     }
 
     std::string SharedCatalog(const std::string& rel) {
@@ -715,10 +752,32 @@ private:
                             line = "  " + field + " 0 ";
                         }
                     }
+                // a vinyl indexes the shared catalog's decal list; one a PS2 package added has no Xbox page
+                if (f == "vinyl" && VinylCount() && (value < 0 || uint32_t(value) >= VinylCount())) {
+                    LOGE("MC3PACK %s: %s %ld is past the game's %u vinyls, none used", rel.c_str(), field.c_str(), value,
+                         VinylCount());
+                    line = "  " + field + " 0 ";
+                }
             }
             out += line + "\r\n";
         }
         return out;
+    }
+
+    // The retail catalog's vinyl count (decal.xbck, the list at +0x0C); 0 when it cannot be read.
+    uint32_t VinylCount() {
+        if (vinyls_ != ~0u) return vinyls_;
+        vinyls_ = 0;
+        try {
+            const std::string host = kernel::ResolvePath(std::string("D:\\") + "resources\\vehicle\\decal.xbck", 0);
+            if (host.empty()) return vinyls_;
+            const std::vector<uint8_t> c = Bytes(host);
+            if (c.size() < 0x100 || U32(c, 4) != 0x25) return vinyls_;
+            const uint32_t table = U32(c, 0x80 + 0xC) - (U32(c, 0) - 0x80);
+            if (size_t(table) + 8 <= c.size()) vinyls_ = U32(c, table + 4);
+        } catch (const std::exception&) {
+        }
+        return vinyls_;
     }
 
     uint32_t Count(const char* file, const char* list) {
@@ -766,6 +825,8 @@ private:
     std::map<std::string, fs::path> shared_ppf_;  // resources\\vehicle\\{rim,exhaust}.ppf, last pack wins
     std::map<std::string, fs::path> shared_catalog_;  // resources\\vehicle\\{decal,decal_g}.pck
     std::map<std::string, std::string> pagefiles_;  // redirected page-file stems, including a remembered failure
+    std::map<std::string, uint32_t> largest_;       // their largest page, the pf05 header's +8
+    uint32_t vinyls_ = ~0u;                         // VinylCount(), read once
     bool lists_read_ = false;
     thread_local static bool reading_;
     std::mutex mutex_;
@@ -822,6 +883,24 @@ void Mc3CarPackPageFileBootstrap(X86Context& ctx, uint8_t* base) {
 X86_FUNC(sub_00210650) {
     Mc3CarPackPageFileBootstrap(ctx, base);
     __imp__sub_00210650(ctx, base);
+}
+
+// 0xF15B0 gives the page manager its fixed blocks, 0x210690(bytes, count, id), and a page goes to the smallest free
+// block that holds its file's largest page (pf05 +8). The rim and exhaust blocks (0x1D800, 0x2800) fit the retail
+// pages; converted PS2 models are larger and would overrun them, so with a converted file they grow to its largest page.
+X86_FUNC(sub_00210690) {
+    Packs& packs = Get();
+    const uint32_t bytes = X86_MEM32(ctx.esp + 4);
+    const char* rel = bytes == 0x1D800 ? "resources\\vehicle\\rim" : bytes == 0x2800 ? "resources\\vehicle\\exhaust" : nullptr;
+    if (rel && !packs.Empty()) {
+        if (Mc3Ps2Effects(base).empty()) {
+            LOGE("MC3PACK page blocks %X: the effect table is not loaded yet, left as they are", bytes);
+        } else if (const uint32_t largest = packs.LargestPage(base, rel); largest > bytes) {
+            X86_MEM32(ctx.esp + 4) = largest;
+            LOGE("MC3PACK page blocks for %s: %X -> %X bytes x %u", rel, bytes, largest, X86_MEM32(ctx.esp + 8));
+        }
+    }
+    __imp__sub_00210690(ctx, base);
 }
 
 // datPageManager releases every block in a loaded page through the size at

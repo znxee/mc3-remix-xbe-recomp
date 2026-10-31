@@ -454,6 +454,16 @@ std::string EffectName(const std::string& tmpl) {
     return (dot == std::string::npos ? tmpl : tmpl.substr(0, dot)) + ".fx";
 }
 
+// A skeleton at file offset s: u16 node count, nodes of 0x44 bytes at +8, their names, all inside the image.
+bool ValidSkeleton(const In& in, uint32_t s) {
+    if (!s || !in.Has(s, 0xC)) return false;
+    const uint32_t n = in.U16(s), nodes = in.Ptr(s + 8);
+    if (n == 0 || n > 256 || !nodes || !in.Has(nodes, n * 0x44)) return false;
+    for (uint32_t i = 0; i < n; i++)
+        if (in.U32(nodes + i * 0x44 + 0xC) && !in.Ptr(nodes + i * 0x44 + 0xC)) return false;
+    return true;
+}
+
 class Converter {
 public:
     Converter(const std::vector<uint8_t>& f, const Effects& fx, Report& r)
@@ -718,6 +728,38 @@ private:
         out_.W32(o, 0x00608EC4u);
         ShaderGroup(in_.Ptr(o + 8));
         for (uint32_t k : {0x10u, 0x14u, 0x18u}) PpfModelLod(in_.Ptr(o + k));
+        // A stale pointer can also land on an object this walk already claimed (and rewrites): the skeleton must not.
+        const uint32_t skeleton = in_.Ptr(o + 0x68);
+        if (ValidSkeleton(in_, skeleton) && Unclaimed(skeleton, 0xC) &&
+            Unclaimed(in_.Ptr(skeleton + 8), in_.U16(skeleton) * 0x44)) {
+            Skeleton(skeleton);
+        } else if (in_.U32(o + 0x68) && skeleton_) {
+            ReplaceSkeleton(o + 0x68, *skeleton_);
+        } else if (in_.U32(o + 0x68)) {
+            out_.W32(o + 0x68, 0);
+            Note("invalid skeleton cleared (no valid one in the page file)");
+        }
+    }
+
+    bool Unclaimed(uint32_t o, uint32_t n) const {
+        for (uint32_t i = 0; i < n; i++)
+            if (in_.TagAt(o + i) != kFree) return false;
+        return true;
+    }
+
+    // A copy of `t` appended to the image, its internal pointers moved with it; `field` names the new header.
+    void ReplaceSkeleton(uint32_t field, const SkeletonTemplate& t) {
+        const uint32_t size = uint32_t(t.bytes.size());
+        const uint32_t body = out_.Alloc(size, 16);
+        const uint32_t shift = out_.Va(body) - t.va;
+        out_.Copy(body, t.bytes.data(), size);
+        for (uint32_t k = 0; k + 4 <= size; k += 4)
+            if (const uint32_t w = Rd32(&t.bytes[k]); w >= t.va && w < t.va + size) out_.W32(body + k, w + shift);
+        const uint32_t header = out_.Alloc(0xC, 16);
+        out_.Copy(header, t.header.data(), 0xC);
+        out_.W32(header + 8, Rd32(&t.header[8]) + shift);
+        out_.W32(field, out_.Va(header));
+        Note("invalid skeleton replaced with the page file's first valid one");
     }
 
     void PpfModelLod(uint32_t o) {
@@ -1337,6 +1379,9 @@ private:
     Report& rep_;
     bool page_model_ = false;
     std::unordered_set<uint32_t> null_textures_;
+
+public:
+    const SkeletonTemplate* skeleton_ = nullptr;  // for a page-file model whose own skeleton is invalid
     std::string error_;
     std::set<uint32_t> seen_, graph_seen_;
     std::vector<std::pair<uint32_t, bool>> graph_roots_;
@@ -1367,8 +1412,9 @@ bool Convert(const std::vector<uint8_t>& file, const Effects& effects, std::vect
     return c.Run(body, base_va, type, error);
 }
 
-bool ConvertShaderModel(const std::vector<uint8_t>& source, uint32_t source_base, const Effects& effects,
-                        std::vector<uint8_t>& body, Report& report, std::string& error) {
+namespace {
+// a page-file model image as Convert() takes it: the 0x80-byte header, then the model
+std::vector<uint8_t> ShaderModelFile(const std::vector<uint8_t>& source, uint32_t source_base) {
     std::vector<uint8_t> file(0x80 + source.size());
     std::memcpy(file.data() + 0x80, source.data(), source.size());
     std::memcpy(file.data(), &source_base, sizeof source_base);
@@ -1376,8 +1422,44 @@ bool ConvertShaderModel(const std::vector<uint8_t>& source, uint32_t source_base
     std::memcpy(file.data() + 4, &kTypeShaderModelImage, sizeof kTypeShaderModelImage);
     std::memcpy(file.data() + 8, &version, sizeof version);
     std::memcpy(file.data() + 12, &size, sizeof size);
+    return file;
+}
+}  // namespace
+
+bool FindSkeleton(const std::vector<uint8_t>& source, uint32_t source_base, SkeletonTemplate& skeleton) {
+    const std::vector<uint8_t> file = ShaderModelFile(source, source_base);
+    const In in(file);
+    if (!in.Valid()) return false;
+    const uint32_t s = in.Ptr(0x80 + 0x68);
+    if (!ValidSkeleton(in, s)) return false;
+    const uint32_t n = in.U16(s), nodes = in.Ptr(s + 8);
+    uint32_t lo = nodes, hi = nodes + n * 0x44;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t node = nodes + i * 0x44;
+        if (const uint32_t name = in.Ptr(node + 0xC)) {
+            uint32_t end = name;
+            while (end < in.End() && in.U8(end)) end++;
+            lo = std::min(lo, name), hi = std::max(hi, end + 1);
+        }
+        // links to other nodes and joint limits: only a skeleton whose links stay among its nodes is copied
+        for (uint32_t k : {0x14u, 0x18u, 0x1Cu, 0x40u})
+            if (const uint32_t p = in.U32(node + k); p && (in.Off(p) < nodes || in.Off(p) >= nodes + n * 0x44))
+                return false;
+    }
+    lo &= ~3u;
+    skeleton.header.assign(in.At(s), in.At(s) + 0xC);
+    skeleton.bytes.assign(in.At(lo), in.At(lo) + (hi - lo));
+    skeleton.va = in.Va(lo);
+    return true;
+}
+
+bool ConvertShaderModel(const std::vector<uint8_t>& source, uint32_t source_base, const Effects& effects,
+                        std::vector<uint8_t>& body, Report& report, std::string& error,
+                        const SkeletonTemplate* skeleton) {
+    const std::vector<uint8_t> file = ShaderModelFile(source, source_base);
     uint32_t converted_base = 0, type = 0;
     Converter c(file, effects, report);
+    c.skeleton_ = skeleton;
     if (!c.Run(body, converted_base, type, error)) return false;
     if (converted_base != source_base || type != kTypeShaderModelImage) {
         error = "shader-model conversion returned an inconsistent image";

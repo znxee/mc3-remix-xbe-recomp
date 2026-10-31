@@ -49,7 +49,20 @@ bool Convert(const std::vector<uint8_t>& file, const Effects& effects, std::vect
 // 0x20-byte stream header before this body; callers pass the bytes after that
 // header and the entry's PS2 virtual base. This is separate from Convert()
 // because a page-file object has no PCK header of its own.
+// A page-file model's skeleton (+0x68): its 0xC-byte header and the bytes [va, va + bytes.size()) holding its nodes
+// and names. Some mod exporters leave a stale +0x68 that points into geometry; the PS2 tolerates it, but the Xbox
+// constructor relocates the nodes it names, so such a model gets a copy of a valid skeleton of the same page file.
+struct SkeletonTemplate {
+    std::vector<uint8_t> header;
+    std::vector<uint8_t> bytes;
+    uint32_t va = 0;
+};
+
+// The skeleton of a page-file model (same arguments as ConvertShaderModel) when it is valid.
+bool FindSkeleton(const std::vector<uint8_t>& source, uint32_t source_base, SkeletonTemplate& skeleton);
+
 bool ConvertShaderModel(const std::vector<uint8_t>& source, uint32_t source_base, const Effects& effects,
-                        std::vector<uint8_t>& body, Report& report, std::string& error);
+                        std::vector<uint8_t>& body, Report& report, std::string& error,
+                        const SkeletonTemplate* skeleton = nullptr);
 
 }  // namespace ps2veh
