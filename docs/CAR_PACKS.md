@@ -97,15 +97,19 @@ added by packs`, and one line per file served.
 * The compact PPF packet decoder is used only for shared rim and exhaust page models. Regular vehicle VIF streams are
   always decoded by the VIF path; treating arbitrary VIF bytes as PPF headers skips VU batches and produces missing
   vehicle panels.
-* **Front-end images** of a new car (`flash\ds_`, `ms_`, `ps_`, `vs_`): an Xbox `.xbck` in the pack is preferred. A loose
-  PS2 `.pck` with the same name is also accepted and served under the requested `.xbck` name; the native Flash resource
-  constructors relocate its relative image just as they do the Xbox one. If neither exists, the stock Jetta's is shown.
-  The loader intentionally does not unpack archive members: extract `ps.zip` and `vs.zip` from a PS2 package into
-  `flash\` first. This keeps pack loading deterministic and avoids adding an archive/decompression runtime dependency.
+* **Shop movies** (`flash\ds_`, `ms_`, `ps_`, `vs_`): a pack's Xbox `.xbck`, or a loose PS2 `.pck` under the requested
+  `.xbck` name, is served when the game opens it, but the game's Flash loader runs only the movies the game itself
+  has: a served copy never shows. A retail car keeps its own movie (its pack menus come with `--mc3-pack-shops`), and
+  a new car runs the stock Jetta's (below). The loader does not unpack archive members: extract `ps.zip` and `vs.zip`
+  from a PS2 package into `flash\` first.
 * A car that is locked by its unlocking rule is locked as for any car.
 * A pack's cars are not in the Showroom (Buy Vehicles) by themselves: the list is the garage movie's, and a pack's own
   `flash\toplevel(_x)` is not what the game runs. `--mc3-showroom-packs` adds them, with their entries read from the
   pack's garage movie (`docs/GARAGE_SCRIPT.md`, Showroom).
+* The same holds for a pack's shop movies of retail cars (a PS2 mod's own rim, part and paint lists):
+  `--mc3-pack-shops` runs their menus on the game's movies (`docs/GARAGE_SCRIPT.md`, Pack shops).
+* The game's Flash loader finds a shop movie only among its own, so a new car's shops run the stock Jetta's movies
+  (with `--mc3-pack-shops`, carrying the car's own pack menus); before, they opened with no menu at all.
 
 ## How it was checked
 
