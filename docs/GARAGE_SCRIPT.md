@@ -18,6 +18,10 @@ from the files it writes.
 
 Each car has four movies, `flash\<shop>_<car>.xbck`:
 
+For a car pack, the requested `.xbck` may be supplied as a loose PS2 `.pck` with the same stem; the native Flash
+constructors relocate the PS2 image. See `docs/CAR_PACKS.md` for the pack layout and the extraction rule for `ps.zip`
+and `vs.zip`.
+
 | Shop | What it sells |
 | --- | --- |
 | `ds` | detail shop: vinyls, badges, decals, license plate |
