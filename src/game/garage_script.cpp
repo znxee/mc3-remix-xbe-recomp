@@ -16,7 +16,8 @@
 // The script's statements for a movie are compiled to AVM1 and run right after the movie's own init action, in the
 // same place: when the game opens the movie (Stream::Open, car_packs.cpp) its init action is kept, and when the action
 // interpreter (0x68BC0) runs that same code it runs the script's after it. The movie is not served changed: its data
-// does not come from the stream that open returns. Arrays the script does not name stay as the movie has them.
+// does not come from the stream that open returns. Unmentioned arrays stay as the movie has them, except
+// Order inferred from edited Names to keep the original icons with their items.
 //
 // --mc3-garage-dump writes every such movie's arrays, as script, to hdd\Z\carpacks\garage_dump\<shop>_<car>.txt, the
 // starting point for editing one.
@@ -28,6 +29,7 @@
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <cstdint>
@@ -342,6 +344,59 @@ std::string Compile(const Statement& st) {
     return code;
 }
 
+// The ring animates slots, but each slot's clip event reads Order to select the item's artwork.
+// Resolve the final Names against the unmodified movie, not against an earlier wildcard edit.
+// Explicit Order statements keep their existing meaning and always win over inference.
+std::vector<Statement> DeriveOrders(const std::vector<Statement>& original,
+                                  const std::vector<const Statement*>& edits, const std::string& rel) {
+    auto findOriginal = [&](const std::string& name) -> const Statement* {
+        for (auto it = original.rbegin(); it != original.rend(); ++it)
+            if (it->name == name) return &*it;
+        return nullptr;
+    };
+    auto finalEdit = [&](const std::string& name) -> const Statement* {
+        for (auto it = edits.rbegin(); it != edits.rend(); ++it)
+            if ((*it)->name == name) return *it;
+        return nullptr;
+    };
+    std::vector<Statement> out;
+    for (const Statement* st : edits) {
+        if (!st->array || st->name.size() <= 5 || st->name.compare(st->name.size() - 5, 5, "Names") != 0 ||
+            finalEdit(st->name) != st) continue;
+        std::string orderName = st->name.substr(0, st->name.size() - 5) + "Order";
+        // This is the movie's actual spelling, including the extra 's'.
+        if (st->name == "ChassisUpgradeNames") orderName = "ChassisUpgradesOrder";
+        if (finalEdit(orderName)) continue;
+        const Statement* names = findOriginal(st->name);
+        const Statement* order = findOriginal(orderName);
+        // Lists without an Order array have their own movie-specific presentation.
+        if (!names || !order || !names->array || !order->array || names->values == st->values) continue;
+        Statement derived;
+        derived.name = orderName;
+        derived.array = true;
+        bool valid = names->values.size() == order->values.size();
+        for (const std::string& item : st->values) {
+            auto it = std::find(names->values.begin(), names->values.end(), item);
+            if (it == names->values.end()) { valid = false; break; }
+            const size_t index = size_t(it - names->values.begin());
+            if (index >= order->values.size()) { valid = false; break; }
+            // A repeated original name is inferable only if every occurrence has the same icon.
+            for (size_t i = index + 1; i < names->values.size() && i < order->values.size(); i++)
+                if (names->values[i] == item && order->values[i] != order->values[index]) valid = false;
+            derived.values.push_back(order->values[index]);
+        }
+        if (!valid) {
+            LOGE("MC3GARAGE %s: cannot derive %s from %s; set %s explicitly to match the edited list",
+                 rel.c_str(), orderName.c_str(), st->name.c_str(), orderName.c_str());
+            continue;
+        }
+        LOGE("MC3GARAGE %s: derived %s from %s (%zu items)", rel.c_str(), orderName.c_str(),
+             st->name.c_str(), derived.values.size());
+        out.push_back(std::move(derived));
+    }
+    return out;
+}
+
 void WriteDump(const std::string& shop, const std::string& car, const std::vector<Statement>& sts) {
     const std::string host = kernel::ResolvePath(std::string(kDump) + shop + "_" + car + ".txt", 0);
     if (host.empty()) return;
@@ -410,18 +465,22 @@ void Mc3GarageScriptSee(const std::string& rel, const std::string& file) {
         LOGE("MC3GARAGE %s: %s, left as it is", rel.c_str(), error.c_str());
         return;
     }
-    if (Get().Dump()) {
-        std::vector<Statement> sts;
-        if (Decode(file, a, sts, error)) WriteDump(shop, car, sts);
-        else LOGE("MC3GARAGE %s: not dumped (%s)", rel.c_str(), error.c_str());
-    }
     const std::vector<const Statement*> sts = Get().For(shop, car);
+    std::vector<Statement> original;
+    const bool decoded = Decode(file, a, original, error);
+    if (decoded) {
+        if (Get().Dump()) WriteDump(shop, car, original);
+    } else {
+        LOGE("MC3GARAGE %s: not decoded (%s); no dump or automatic icon order", rel.c_str(), error.c_str());
+    }
     if (sts.empty()) return;
     Pending p;
     p.rel = rel;
     p.code = file.substr(a.code, a.end + 1 - a.code);
     p.extra = file.substr(a.block, 2);
     for (const Statement* st : sts) p.extra += Compile(*st);
+    if (decoded)
+        for (const Statement& st : DeriveOrders(original, sts, rel)) p.extra += Compile(st);
     p.extra += char(0);
     LOGE("MC3GARAGE %s: %zu statements from the script", rel.c_str(), sts.size());
     g_pending.push_back(std::move(p));
