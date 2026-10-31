@@ -39,6 +39,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -101,17 +102,59 @@ std::string Quote(const std::string& v) {
     return needs ? "\"" + v + "\"" : v;
 }
 
-std::vector<Section> Parse(const fs::path& file) {
+// Strict UTF-8, including supplementary characters; reject overlong and surrogate encodings.
+bool Utf16(const std::string& utf8, std::u16string& out) {
+    for (size_t i = 0; i < utf8.size();) {
+        const uint8_t first = uint8_t(utf8[i++]);
+        uint32_t c = 0;
+        int n = 0;
+        if (first < 0x80) c = first;
+        else if (first >= 0xC2 && first <= 0xDF) c = first & 0x1F, n = 1;
+        else if (first >= 0xE0 && first <= 0xEF) c = first & 0x0F, n = 2;
+        else if (first >= 0xF0 && first <= 0xF4) c = first & 0x07, n = 3;
+        else return false;
+        if (i + n > utf8.size()) return false;
+        for (int k = 0; k < n; ++k) {
+            const uint8_t b = uint8_t(utf8[i++]);
+            if ((b & 0xC0) != 0x80) return false;
+            c = (c << 6) | (b & 0x3F);
+        }
+        if ((n == 2 && c < 0x800) || (n == 3 && c < 0x10000) || c > 0x10FFFF ||
+            (c >= 0xD800 && c <= 0xDFFF) || c == 0) return false;
+        if (c < 0x10000) out.push_back(char16_t(c));
+        else {
+            c -= 0x10000;
+            out.push_back(char16_t(0xD800 + (c >> 10)));
+            out.push_back(char16_t(0xDC00 + (c & 0x3FF)));
+        }
+    }
+    return true;
+}
+
+std::vector<Section> Parse(const fs::path& file, std::map<std::string, std::u16string>& strings,
+                           std::map<std::string, std::string>& aliases, bool enabled) {
     std::ifstream in(file, std::ios::binary);
     std::vector<Section> out;
     std::string line;
+    bool in_strings = false, in_section = false;
     uint32_t number = 0;
     while (std::getline(in, line)) {
         number++;
         if (number == 1 && line.rfind("\xEF\xBB\xBF", 0) == 0) line.erase(0, 3);
         line = Trim(line);
         if (line.empty() || line[0] == ';' || line[0] == '#') continue;
+        if (line.rfind("alias ", 0) == 0) {
+            const size_t eq = line.find('=');
+            const std::string name = eq == std::string::npos ? "" : Trim(line.substr(6, eq - 6));
+            const std::string target = eq == std::string::npos ? "" : Trim(line.substr(eq + 1));
+            if (name.empty() || target.empty()) LOGE("MC3GARAGE %ls:%u: expected alias <name> = <target>", file.c_str(), number);
+            else if (enabled) aliases[name] = target;
+            continue;
+        }
         if (line[0] == '[') {
+            in_strings = line == "[strings]";
+            in_section = false;
+            if (in_strings) continue;
             std::istringstream words(line.substr(1, line.find(']') - 1));
             Section s;
             words >> s.car >> s.shop;
@@ -121,11 +164,21 @@ std::vector<Section> Parse(const fs::path& file) {
                 continue;
             }
             out.push_back(std::move(s));
+            in_section = true;
             continue;
         }
         const size_t eq = line.find('=');
-        if (eq == std::string::npos || out.empty()) {
+        if (eq == std::string::npos || (!in_section && !in_strings)) {
             LOGE("MC3GARAGE %ls:%u: expected <name> = <value> inside a [<car> <shop>] section", file.c_str(), number);
+            continue;
+        }
+        if (in_strings) {
+            const std::string key = Trim(line.substr(0, eq));
+            std::string value = Trim(line.substr(eq + 1));
+            if (value.size() >= 2 && value.front() == '"' && value.back() == '"') value = value.substr(1, value.size() - 2);
+            std::u16string text;
+            if (key.empty() || !Utf16(value, text)) LOGE("MC3GARAGE %ls:%u: invalid string key or UTF-8", file.c_str(), number);
+            else if (enabled) strings[key] = std::move(text);
             continue;
         }
         Statement st;
@@ -149,6 +202,7 @@ class Script {
 public:
     Script() {
         dump_ = Mc3DebugHasArg(L"--mc3-garage-dump");
+        const bool enabled = Mc3DebugHasArg(L"--mc3-garage-script");
         std::vector<fs::path> files;
         if (const wchar_t* v = Mc3DebugArg(L"--mc3-garage-script"); v && *v) files.emplace_back(v);
         std::error_code ec;
@@ -159,7 +213,7 @@ public:
                 LOGE("MC3GARAGE script %ls not found", f.c_str());
                 continue;
             }
-            std::vector<Section> s = Parse(f);
+            std::vector<Section> s = Parse(f, strings_, aliases_, enabled);
             size_t n = 0;
             for (const Section& x : s) n += x.statements.size();
             LOGE("MC3GARAGE script %ls: %zu sections, %zu statements", f.c_str(), s.size(), n);
@@ -167,7 +221,21 @@ public:
         }
     }
 
-    bool Active() const { return dump_ || !sections_.empty(); }
+    bool Active() const { return dump_ || !sections_.empty() || !strings_.empty() || !aliases_.empty(); }
+
+    const std::u16string* Text(const std::string& key) const {
+        const auto it = strings_.find(key);
+        return it == strings_.end() ? nullptr : &it->second;
+    }
+
+    bool Alias(const std::string& name, std::string& target) const {
+        const auto it = aliases_.find(name);
+        if (it == aliases_.end()) return false;
+        target = it->second;
+        return true;
+    }
+
+    bool HasAliases() const { return !aliases_.empty(); }
 
     bool Wants(const std::string& shop, const std::string& car) const {
         if (dump_) return true;
@@ -191,6 +259,8 @@ public:
 private:
     bool dump_ = false;
     std::vector<Section> sections_;
+    std::map<std::string, std::u16string> strings_;
+    std::map<std::string, std::string> aliases_;
 };
 
 const Script& Get() {
@@ -446,6 +516,12 @@ std::atomic<bool> g_any{false};  // the interpreter runs every frame: nothing to
 
 // For car_packs.cpp, which sees the files the game opens.
 bool Mc3GarageScriptActive() { return Get().Active(); }
+
+const std::u16string* Mc3GarageString(const std::string& key) { return Get().Text(key); }
+
+bool Mc3GarageAlias(const std::string& name, std::string& target) { return Get().Alias(name, target); }
+
+bool Mc3GarageHasAliases() { return Get().HasAliases(); }
 
 bool Mc3GarageScriptWants(const std::string& rel) {
     std::string shop, car;
