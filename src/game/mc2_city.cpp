@@ -1902,6 +1902,24 @@ void Mc2ApplyDebugBootArgs() {
     }
 }
 
+// Test-only retail garage selector.  Unlike --mc3-mc2-car this does not enter
+// MC2 Career: it replaces the active profile's slot 0 whenever its frontend
+// menu is rebuilt, after the profile has been loaded from the isolated HDD.
+// It is deliberately opt-in and never persists outside the game's normal save
+// path (the MC3-0026 runner restores hdd6 for every process).
+void ApplyDebugGarageCar(uint8_t* base) {
+    const wchar_t* value = Mc3DebugArg(L"--mc3-garage-car");
+    if (!value || !*value) return;
+    // Retail vehicle records extend beyond the ten MC2 Career presets.  The
+    // validated stock-record table has 64 entries at this address/stride;
+    // MC3-0026 validates index 0 as Eclipse and index 5 as Monte Carlo after
+    // the selected profile has populated this table.
+    int index = std::clamp(_wtoi(value), 0, 63);
+    X86_MEM8(0x53F80C) = 1;
+    X86_MEM16(0x53F2FE) = 0;
+    std::memcpy(base + 0x53F810, base + 0x541700u + 0x108u * uint32_t(index), 0x108);
+}
+
 // 1. MC2 CAREER is a main menu row of its own, below Tokyo Challenge; the retail Career row stays as it is.
 // mcMenuModeSelect::PopulateMenu (0x18C770) adds Career (callback 0x18C560), Tokyo Challenge (0x18C580) and Arcade
 // (0x18C530) through mcUiListMenu::AddEntry; AddEntry's item insert (0x348BE0) appends at the list's count, its first
@@ -1919,6 +1937,7 @@ X86_FUNC(sub_00349A40) {
     }
     if (args[4] == 0x18C560u && args[3] != kMc2MenuSelfTag) RestoreRetailCareer(ctx, base);
     __imp__sub_00349A40(ctx, base);
+    ApplyDebugGarageCar(base);
     if (g_enabled && args[4] == 0x18C580u) {
         static uint32_t text_va = 0;
         if (!text_va) {

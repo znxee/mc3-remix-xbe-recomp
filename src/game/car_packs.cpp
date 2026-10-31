@@ -61,7 +61,9 @@ X86_EXTERN_FUNC(__imp__sub_00210690);  // page manager: add fixed blocks (bytes,
 bool Mc3GarageScriptActive();  // garage_script.cpp, --mc3-garage-script
 bool Mc3GarageScriptWants(const std::string& rel);
 void Mc3GarageScriptSee(const std::string& rel, const std::string& file);
+bool Mc3GarageShowroomMovie(const std::string& rel);  // --mc3-showroom-packs
 const ps2veh::Effects& Mc3Ps2Effects(uint8_t* base);  // ps2_car_loader.cpp
+const std::u16string* Mc3GarageString(const std::string& key);
 
 namespace {
 
@@ -548,7 +550,11 @@ public:
     // the host file standing in for `rel`, written on first use; empty to let the game open its own
     std::string Serve(X86Context& ctx, uint8_t* base, const std::string& rel) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (auto it = served_.find(rel); it != served_.end()) return it->second;
+        if (auto it = served_.find(rel); it != served_.end()) {
+            // A cached shop can become active again after another car or shop was opened.
+            if (Mc3GarageScriptActive() && rel.rfind("flash\\", 0) == 0) Mc3GarageScriptWants(rel);
+            return it->second;
+        }
         std::string xbox;
         if (kMerged.count(rel)) xbox = Merge(ctx, base, rel);
         else if (rel == "resources\\vehicle\\decal.xbck" || rel == "resources\\vehicle\\decal_g.xbck")
@@ -677,6 +683,10 @@ private:
             pck.replace(pck.size() - 5, 5, ".pck");
             f = Find(pck);
             if (f) LOGE("MC3PACK %s: using PS2 %s", rel.c_str(), pck.c_str());
+        }
+        if (f && Mc3GarageShowroomMovie(rel)) {  // the game's garage movie runs; the pack's gives Showroom entries
+            LOGE("MC3PACK %s: the game's own is used, the pack's is read for the Showroom", rel.c_str());
+            f = nullptr;
         }
         static const char* kPrefixes[] = {"flash\\ds_", "flash\\ms_", "flash\\ps_", "flash\\vs_"};
         for (const char* pre : kPrefixes) {
@@ -959,15 +969,18 @@ bool Mc3CarPackOpen(X86Context& ctx, uint8_t* base) {
     return xbox.rfind("\\Device\\", 0) == 0;  // a stock image on D: opens the usual way
 }
 
-// txtStringTable::Get (0xEA750, ecx = table, key). For a key the game lacks it makes and keeps an entry reading
-// "!!key!!"; when a car pack names the key, that entry gets the pack's text instead (car names, descriptions).
+// txtStringTable::Get (0xEA750, ecx = table, key). Script labels override retail text; pack strings fill missing keys.
 X86_FUNC(sub_000EA750) {
     const Packs& packs = Get();
-    if (packs.Empty()) {
+    const uint32_t key = X86_MEM32(ctx.esp + 4);
+    static const bool script = Mc3DebugHasArg(L"--mc3-garage-script");
+    const std::u16string* label = script && key >= 0x10000
+                                     ? Mc3GarageString(reinterpret_cast<const char*>(base + key)) : nullptr;
+    if (packs.Empty() && !label) {
         __imp__sub_000EA750(ctx, base);
         return;
     }
-    const uint32_t table = ctx.ecx, key = X86_MEM32(ctx.esp + 4);
+    const uint32_t table = ctx.ecx;
     const uint32_t eax = ctx.eax, ecx = ctx.ecx, edx = ctx.edx, esp = ctx.esp;
     X86_PUSH32(key);
     X86_PUSH32(0);
@@ -985,10 +998,17 @@ X86_FUNC(sub_000EA750) {
         ctx.esp = esp;
     }
     ctx.eax = eax, ctx.ecx = ecx, ctx.edx = edx;
-    const std::u16string* text = found ? nullptr : packs.Text(hash);
+    const std::u16string* text = label ? label : (found ? nullptr : packs.Text(hash));
     __imp__sub_000EA750(ctx, base);
     const uint32_t entry = ctx.eax;
     if (!text || !entry) return;
+    // The hook is called on every lookup. Reuse the installed value on subsequent calls.
+    const uint32_t current = X86_MEM32(entry + 8);
+    if (current) {
+        size_t i = 0;
+        while (i < text->size() && X86_MEM16(current + uint32_t(i * 2)) == (*text)[i]) ++i;
+        if (i == text->size() && X86_MEM16(current + uint32_t(i * 2)) == 0) return;
+    }
     const uint32_t keep = ctx.eax, ecx2 = ctx.ecx, edx2 = ctx.edx, esp2 = ctx.esp;
     X86_PUSH32(uint32_t((text->size() + 1) * 2));
     X86_PUSH32(0);
