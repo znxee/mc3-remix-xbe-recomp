@@ -61,6 +61,7 @@ X86_EXTERN_FUNC(__imp__sub_00210690);  // page manager: add fixed blocks (bytes,
 bool Mc3GarageScriptActive();  // garage_script.cpp, --mc3-garage-script
 bool Mc3GarageScriptWants(const std::string& rel);
 void Mc3GarageScriptSee(const std::string& rel, const std::string& file);
+bool Mc3GarageShowroomMovie(const std::string& rel);  // --mc3-showroom-packs
 const ps2veh::Effects& Mc3Ps2Effects(uint8_t* base);  // ps2_car_loader.cpp
 const std::u16string* Mc3GarageString(const std::string& key);
 
@@ -682,6 +683,10 @@ private:
             pck.replace(pck.size() - 5, 5, ".pck");
             f = Find(pck);
             if (f) LOGE("MC3PACK %s: using PS2 %s", rel.c_str(), pck.c_str());
+        }
+        if (f && Mc3GarageShowroomMovie(rel)) {  // the game's garage movie runs; the pack's gives Showroom entries
+            LOGE("MC3PACK %s: the game's own is used, the pack's is read for the Showroom", rel.c_str());
+            f = nullptr;
         }
         static const char* kPrefixes[] = {"flash\\ds_", "flash\\ms_", "flash\\ps_", "flash\\vs_"};
         for (const char* pre : kPrefixes) {

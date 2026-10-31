@@ -165,6 +165,74 @@ flash\ms_vp_eclipse_04.xbck: N statements from the script` and, with the dump, `
 * The garage's own top level (Manage Vehicles, Customize Vehicle, Buy Vehicles, Exit Garage) lives in the garage movie,
   not in the shop movies.
 
+## Showroom: the packs' cars for sale
+
+| Flag | Default | What it does |
+| --- | --- | --- |
+| `--mc3-showroom-packs` | off | The Showroom (Buy Vehicles) lists the car packs' cars, so they can be bought. |
+
+The Showroom is the garage movie's, `flash\toplevel_x.xbck`: nine parallel arrays in its init action, `ShowRoomNames`,
+`ShowRoomPrice`, `ShowRoomStatus`, `ShowroomClass`, `ShowroomPerf`, `AccelMin`, `TopSpeedMin`, `HandlingMin` and
+`PrizeStatus`. The retail list has the 94 cars and 23 `vp_dlslot_NN` placeholders (Xbox Live slots, no status, not
+shown). With the flag the same mechanism as the shops runs new arrays right after that init action:
+
+* Every car of the vehicle list (the merged `vehicle.lst`) that the Showroom lacks is added, at its vehicle-list index:
+  it takes the placeholder there, or is appended when it is the next entry. The game writes the Remix SpecialEdition
+  cars' class, perf and price into these arrays by vehicle index (`0x152420`), so the two orders are kept the same; a car
+  that cannot keep its index is logged.
+* A car's entries come from its pack's own garage movie, `flash\toplevel(_x).pck` or `.xbck` (a PS2 VIP-style movie is
+  read by running its Showroom blocks in file order, the last assignment winning), then from `[showroom]` rows. The
+  pack's garage movie is only read: the game's own one runs.
+* A car with no entry anywhere is left out and logged (`... has no Showroom entry in its pack`).
+* The list stays under 128 entries: the game finds a name's index with a signed byte (`0x144BE0`).
+* The movie's ring shows `ShowRoomNames.length - 23 + XBliveCars` entries (the 23 placeholders are never shown), and
+  `0x152420` sets `XBliveCars` from the Xbox Live car count (`[0x557EAC]`, 0 here). The flag raises that value, where
+  the game writes it (`0x139520` called from `0x152420`), by the number of placeholders pack cars took, so every
+  added car is reachable.
+
+```text
+[showroom]
+; <car> = price, status, class, perf, accel, top speed, handling, prize
+vp_d_golf_83 = $16000.00, 2, 1, d, 12.358152, 33.451324, 41.176467, 0
+vp_eclipse_04 = $1.00                   ; trailing or empty fields keep the movie's; a listed car changes in place
+```
+
+`[showroom]` rows go in a pack's `garage.txt` or the `--mc3-garage-script` file and are read only with
+`--mc3-showroom-packs`. With `--mc3-garage-dump` the resulting list is written as such rows to
+`garage_dump\showroom_toplevel_x.txt`. The log has `MC3SHOWROOM <movie>: N cars` for each pack movie read and
+`MC3SHOWROOM flash\toplevel_x.xbck: N vehicles; N pack cars on N placeholders, N appended ...`.
+
+The statuses are the movies' own (`2`, `5`, `7` in the retail list). In the checks below `2` showed the car with its
+price and `5` showed `Locked` with no model; other values were not measured.
+
+Limits seen in the checks:
+
+* The ring icons and the manufacturer logo in the footer are chosen by list position, not by name: an added car
+  shows the Xbox Live icon of the placeholder whose place it took (or the last one), and some retail car's logo.
+  New artwork would need a changed movie.
+* The bars' numbers are the game's own calculation, as for retail cars; they are close to, not equal to, the
+  `AccelMin`/`TopSpeedMin`/`HandlingMin` entries.
+* `0x152420` only re-selects a car in the ring by name when its index is under 99 (the `[0x4B22E0] < 100` check);
+  cars further down the list are not re-selected that way (the effect was not observed in the checks).
+
+### How the Showroom was checked
+
+Integration build, legacy profile, Player 1 of the `existing` save on an isolated `hdd6`, the VIP pack v1.0.2
+(28 cars, PS2 `flash\toplevel.pck` and `toplevel_x.pck`):
+
+* The log read 122 cars from `toplevel.pck` and 147 from `toplevel_x.pck`, and put all 28 cars at their own vehicle
+  index (23 on placeholders, 5 appended, 122 entries). The dump matched the VIP's rows.
+* Going left from the first retail car the ring reached all 122 entries (index 122 Firebird down to 96 Miura), with the
+  VIP names, prices and classes. Before the `XBliveCars` correction it wrapped at 99.
+* Golf GTI and 280Z (status `2`) showed their model, name and `$16,000`; Maybach, R8, Cobra and others (status `5`)
+  showed `Locked`.
+* With `[showroom] vp_d_golf_83 = $1.00`: Purchase this vehicle? took $1 ($1,402 -> $1,401), the owned-car list went
+  from `vp_srt4_04` to `vp_srt4_04, vp_d_golf_83` (`0x53F80C`/`0x53F810` records) and the garage showed the Golf as the
+  current car. No `exception` or `KeBugCheck` in the log.
+* Without the flag the same pack gave the retail list and no `MC3SHOWROOM` line.
+* Not checked: saving and reloading a profile with a bought pack car, Manage Vehicles with it, and a career race with
+  it (the VIP cars were driven in Arcade before, MC3-0028).
+
 ## How it was checked
 
 MC3-0024, legacy profile, Eclipse, with no explicit Order assignments:

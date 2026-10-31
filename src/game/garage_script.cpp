@@ -21,6 +21,9 @@
 //
 // --mc3-garage-dump writes every such movie's arrays, as script, to hdd\Z\carpacks\garage_dump\<shop>_<car>.txt, the
 // starting point for editing one.
+//
+// --mc3-showroom-packs does the same for the garage movie (flash\toplevel_x.xbck): its Showroom arrays get the car
+// packs' cars, with entries from each pack's own garage movie and [showroom] rows (see ShowroomStatements).
 
 #include "core/log.h"
 #include "cpu/x86_context.h"
@@ -42,6 +45,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -57,8 +61,15 @@ constexpr char kDump[] = "\\Device\\Harddisk0\\Partition5\\carpacks\\garage_dump
 struct Statement {
     std::string name;
     bool array = false;
+    bool ints = false;  // pushed as integers, as the movie has them (ShowroomClass)
     std::vector<std::string> values;  // one for a plain value
 };
+
+// One car of the Showroom list: its entry in each of the movie's parallel arrays, Names first.
+constexpr const char* kShowroom[] = {"ShowRoomNames", "ShowRoomPrice", "ShowRoomStatus", "ShowroomClass", "ShowroomPerf",
+                                     "AccelMin",      "TopSpeedMin",   "HandlingMin",    "PrizeStatus"};
+constexpr size_t kShowroomFields = std::size(kShowroom) - 1;
+using ShowroomRow = std::vector<std::string>;  // kShowroomFields values, "" for one not given
 
 struct Section {
     std::string car;   // "*" for every car
@@ -133,11 +144,12 @@ bool Utf16(const std::string& utf8, std::u16string& out) {
 }
 
 std::vector<Section> Parse(const fs::path& file, std::map<std::string, std::u16string>& strings,
-                           std::map<std::string, std::string>& aliases, bool enabled) {
+                           std::map<std::string, std::string>& aliases,
+                           std::vector<std::pair<std::string, ShowroomRow>>& showroom, bool enabled) {
     std::ifstream in(file, std::ios::binary);
     std::vector<Section> out;
     std::string line;
-    bool in_strings = false, in_section = false;
+    bool in_strings = false, in_section = false, in_showroom = false;
     uint32_t number = 0;
     while (std::getline(in, line)) {
         number++;
@@ -154,8 +166,9 @@ std::vector<Section> Parse(const fs::path& file, std::map<std::string, std::u16s
         }
         if (line[0] == '[') {
             in_strings = line == "[strings]";
+            in_showroom = Lower(line) == "[showroom]";
             in_section = false;
-            if (in_strings) continue;
+            if (in_strings || in_showroom) continue;
             std::istringstream words(line.substr(1, line.find(']') - 1));
             Section s;
             words >> s.car >> s.shop;
@@ -169,8 +182,20 @@ std::vector<Section> Parse(const fs::path& file, std::map<std::string, std::u16s
             continue;
         }
         const size_t eq = line.find('=');
-        if (eq == std::string::npos || (!in_section && !in_strings)) {
+        if (eq == std::string::npos || (!in_section && !in_strings && !in_showroom)) {
             LOGE("MC3GARAGE %ls:%u: expected <name> = <value> inside a [<car> <shop>] section", file.c_str(), number);
+            continue;
+        }
+        if (in_showroom) {  // <car> = price, status, class, perf, accel, top speed, handling, prize
+            const std::string car = Lower(Trim(line.substr(0, eq)));
+            ShowroomRow row = SplitList(line.substr(eq + 1));
+            if (car.empty() || row.empty() || row.size() > kShowroomFields)
+                LOGE("MC3GARAGE %ls:%u: expected <car> = price, status, class, perf[, accel, top speed, handling, prize]",
+                     file.c_str(), number);
+            else {  // used only with --mc3-showroom-packs
+                row.resize(kShowroomFields);
+                showroom.emplace_back(car, std::move(row));
+            }
             continue;
         }
         if (in_strings) {
@@ -203,6 +228,7 @@ class Script {
 public:
     Script() {
         dump_ = Mc3DebugHasArg(L"--mc3-garage-dump");
+        showroom_packs_ = Mc3DebugHasArg(L"--mc3-showroom-packs");
         const bool enabled = Mc3DebugHasArg(L"--mc3-garage-script");
         std::vector<fs::path> files;
         if (const wchar_t* v = Mc3DebugArg(L"--mc3-garage-script"); v && *v) files.emplace_back(v);
@@ -214,15 +240,26 @@ public:
                 LOGE("MC3GARAGE script %ls not found", f.c_str());
                 continue;
             }
-            std::vector<Section> s = Parse(f, strings_, aliases_, enabled);
+            std::vector<std::pair<std::string, ShowroomRow>> showroom;
+            std::vector<Section> s = Parse(f, strings_, aliases_, showroom, enabled);
             size_t n = 0;
             for (const Section& x : s) n += x.statements.size();
-            LOGE("MC3GARAGE script %ls: %zu sections, %zu statements", f.c_str(), s.size(), n);
+            LOGE("MC3GARAGE script %ls: %zu sections, %zu statements, %zu showroom cars", f.c_str(), s.size(), n,
+                 showroom.size());
             for (Section& x : s) sections_.push_back(std::move(x));
+            if (showroom_packs_)
+                for (auto& row : showroom) showroom_.push_back(std::move(row));
         }
     }
 
-    bool Active() const { return dump_ || !sections_.empty() || !strings_.empty() || !aliases_.empty(); }
+    bool Active() const {
+        return dump_ || showroom_packs_ || !sections_.empty() || !strings_.empty() || !aliases_.empty();
+    }
+
+    bool ShowroomPacks() const { return showroom_packs_; }
+
+    // [showroom] rows, in script order (a later one wins field by field)
+    const std::vector<std::pair<std::string, ShowroomRow>>& Showroom() const { return showroom_; }
 
     const std::u16string* Text(const std::string& key) const {
         const auto it = strings_.find(key);
@@ -240,6 +277,7 @@ public:
 
     bool Wants(const std::string& shop, const std::string& car) const {
         if (dump_) return true;
+        if (shop == "toplevel") return showroom_packs_;
         for (const Section& s : sections_)
             if (s.shop == shop && (s.car == "*" || s.car == car)) return true;
         return false;
@@ -259,6 +297,8 @@ public:
 
 private:
     bool dump_ = false;
+    bool showroom_packs_ = false;
+    std::vector<std::pair<std::string, ShowroomRow>> showroom_;
     std::vector<Section> sections_;
     std::map<std::string, std::u16string> strings_;
     std::map<std::string, std::string> aliases_;
@@ -305,11 +345,13 @@ bool FindAction(const std::string& f, Action& a, std::string& error) {
     return true;
 }
 
-// The statements of an init action (ConstantPool, Push, GetVariable, NewObject, SetMember is all the shop movies use).
+// The statements of an init action (ConstantPool, Push, GetVariable, NewObject, SetMember is all the shop movies use;
+// toplevel's ends in a Stop).
 bool Decode(const std::string& f, const Action& a, std::vector<Statement>& out, std::string& error) {
     struct Value {
         std::string text;
         bool array = false;
+        bool number = false;  // an integer push; for an array, every item one
         std::vector<std::string> items;
     };
     std::vector<std::string> pool;
@@ -341,7 +383,7 @@ bool Decode(const std::string& f, const Action& a, std::vector<Statement>& out, 
                 const uint8_t t = uint8_t(f[q++]);
                 Value v;
                 if (t == 0) v.text = cstr(q);
-                else if (t == 7) v.text = std::to_string(int32_t(U32(f, q))), q += 4;
+                else if (t == 7) v.text = std::to_string(int32_t(U32(f, q))), v.number = true, q += 4;
                 else if (t == 8) {
                     const size_t i = uint8_t(f[q]);
                     v.text = i < pool.size() ? pool[i] : "";
@@ -355,6 +397,16 @@ bool Decode(const std::string& f, const Action& a, std::vector<Statement>& out, 
                     float x;
                     std::memcpy(&x, f.data() + q, 4);
                     v.text = std::to_string(x), q += 4;
+                } else if (t == 6) {  // a double, its two words swapped
+                    uint32_t w[2];
+                    std::memcpy(w, f.data() + q, 8);
+                    const uint64_t bits = (uint64_t(w[0]) << 32) | w[1];
+                    double x;
+                    std::memcpy(&x, &bits, 8);
+                    char buf[32];
+                    std::snprintf(buf, sizeof buf, "%.9g", x);
+                    v.text = buf, q += 8;
+                } else if (t == 2 || t == 3) {  // null, undefined
                 } else return error = "push of type " + std::to_string(t), false;
                 stack.push_back(std::move(v));
             }
@@ -367,9 +419,12 @@ bool Decode(const std::string& f, const Action& a, std::vector<Statement>& out, 
             if (!pop(name) || !pop(count)) return error = "stack", false;
             Value arr;
             arr.array = true;
-            for (int i = 0, n = std::atoi(count.text.c_str()); i < n; i++) {
+            const int n = std::atoi(count.text.c_str());
+            arr.number = n > 0;
+            for (int i = 0; i < n; i++) {
                 Value e;
                 if (!pop(e)) return error = "stack", false;
+                arr.number &= e.number;
                 arr.items.push_back(std::move(e.text));
             }
             stack.push_back(std::move(arr));
@@ -379,8 +434,10 @@ bool Decode(const std::string& f, const Action& a, std::vector<Statement>& out, 
             Statement st;
             st.name = name.text;
             st.array = value.array;
+            st.ints = value.array && value.number;
             st.values = value.array ? std::move(value.items) : std::vector<std::string>{value.text};
             out.push_back(std::move(st));
+        } else if (op == 0x07) {  // Stop
         } else {
             char buf[48];
             std::snprintf(buf, sizeof buf, "action 0x%02X", op);
@@ -395,6 +452,20 @@ void Push(std::string& code, const std::string& s) {
     code += char(0x96), code += char(len & 0xFF), code += char(len >> 8), code += char(0), code += s, code += char(0);
 }
 
+void PushInt(std::string& code, int32_t v) {
+    code += char(0x96), code += char(5), code += char(0), code += char(7);
+    code.append(reinterpret_cast<const char*>(&v), 4);
+}
+
+bool Int(const std::string& text, int32_t& v) {
+    char* end = nullptr;
+    const long long n = std::strtoll(text.c_str(), &end, 10);
+    if (text.empty() || *end || n < std::numeric_limits<int32_t>::min() || n > std::numeric_limits<int32_t>::max())
+        return false;
+    v = int32_t(n);
+    return true;
+}
+
 // _global.<name> = <value> or new Array(<values>), as the movies write it: the first element is pushed last
 std::string Compile(const Statement& st) {
     std::string code;
@@ -402,10 +473,12 @@ std::string Compile(const Statement& st) {
     code += char(0x1C);
     Push(code, st.name);
     if (st.array) {
-        for (auto it = st.values.rbegin(); it != st.values.rend(); ++it) Push(code, *it);
-        const uint32_t n = uint32_t(st.values.size());
-        code += char(0x96), code += char(5), code += char(0), code += char(7);
-        code.append(reinterpret_cast<const char*>(&n), 4);
+        for (auto it = st.values.rbegin(); it != st.values.rend(); ++it) {
+            int32_t v;
+            if (st.ints && Int(*it, v)) PushInt(code, v);
+            else Push(code, *it);
+        }
+        PushInt(code, int32_t(st.values.size()));
         Push(code, "Array");
         code += char(0x40);
     } else {
@@ -488,10 +561,28 @@ void WriteDump(const std::string& shop, const std::string& car, const std::vecto
     LOGE("MC3GARAGE dump %s", host.c_str());
 }
 
-// "flash\ms_vp_350z_04.xbck" -> ms, vp_350z_04
+// The Showroom as the game will list it, as a [showroom] section, to garage_dump\showroom_<movie>.txt.
+void WriteShowroom(const std::string& movie, const std::vector<std::string>& rows) {
+    const std::string host = kernel::ResolvePath(std::string(kDump) + "showroom_" + movie + ".txt", 0);
+    if (host.empty()) return;
+    std::error_code ec;
+    fs::create_directories(fs::path(host).parent_path(), ec);
+    std::ofstream out(host, std::ios::binary);
+    out << "; flash\\" << movie << ".xbck's Showroom, in list order\r\n"
+        << "; <car> = price, status, class, perf, accel, top speed, handling, prize\r\n[showroom]\r\n";
+    for (const std::string& r : rows) out << r << "\r\n";
+    LOGE("MC3GARAGE dump %s", host.c_str());
+}
+
+// "flash\ms_vp_350z_04.xbck" -> ms, vp_350z_04; "flash\toplevel_x.xbck" (the garage, with the Showroom) -> toplevel
 bool ShopAndCar(const std::string& rel, std::string& shop, std::string& car) {
     static const char kPrefix[] = "flash\\";
     const size_t n = sizeof kPrefix - 1;
+    if (rel == "flash\\toplevel_x.xbck" || rel == "flash\\toplevel.xbck") {
+        shop = "toplevel";
+        car = rel.substr(n, rel.rfind('.') - n);
+        return true;
+    }
     if (rel.compare(0, n, kPrefix) != 0 || rel.size() < n + 4 || rel[n + 2] != '_') return false;
     shop = rel.substr(n, 2);
     if (shop != "ds" && shop != "ms" && shop != "ps" && shop != "vs") return false;
@@ -499,6 +590,295 @@ bool ShopAndCar(const std::string& rel, std::string& shop, std::string& car) {
     if (dot == std::string::npos || rel.compare(dot, std::string::npos, ".xbck") != 0) return false;
     car = rel.substr(n + 3, dot - n - 3);
     return true;
+}
+
+// --mc3-showroom-packs: the Showroom (Buy Vehicles) lists the packs' cars.
+//
+// The list is the nine parallel arrays (kShowroom) of the garage movie's init action, flash\toplevel_x.xbck: 94 cars
+// and 23 vp_dlslot_NN placeholders (Xbox Live slots, no status: not shown). Buying goes by name (0x1440D0 resolves the
+// selected name in the vehicle list), but 0x152420 writes the Remix SpecialEdition cars' class, perf and price into
+// these arrays at their vehicle-list index, so the list's order is the vehicle list's: a pack car takes the place of
+// the placeholder at its own vehicle index, or is appended when it is the next one. Name -> list index (0x144BE0)
+// counts in a signed byte, so the list stays under 128 entries.
+//
+// A car's entries come from its pack's own garage movie (flash\toplevel(_x).pck or .xbck, a PS2 one fills the same
+// arrays, often element by element in later action blocks), then from [showroom] rows of the scripts:
+//   [showroom]
+//   vp_d_golf_83 = $16000.00, 2, 1, d, 12.358152, 33.451324, 41.176467, 0
+// (price, status, class, perf, accel, top speed, handling, prize; trailing or empty fields keep the movie's). A row for
+// a car already on the list changes it in place.
+
+constexpr size_t kShowroomMax = 127;
+constexpr uint32_t kVehicleList = 0x557EB0;  // 0x28-byte entries, name at +0; count word at +4
+
+bool Placeholder(const std::string& name) { return name.rfind("vp_dlslot_", 0) == 0; }
+
+// The garage movie shows ShowRoomNames.length - 23 + XBliveCars entries (its ring set-up, "numberofitems": the 23
+// placeholders are not shown). Placeholders taken by pack cars are counted back in through XBliveCars.
+std::atomic<int> g_showroom_extra{0};
+
+// The vehicle list's names, in its order.
+std::vector<std::string> VehicleNames() {
+    std::vector<std::string> out;
+    uint8_t* base = mem::Base();
+    const uint32_t list = *reinterpret_cast<uint32_t*>(base + kVehicleList);
+    const uint32_t count = *reinterpret_cast<uint16_t*>(base + kVehicleList + 4);
+    if (!list || !mem::IsCommitted(list) || !mem::IsCommitted(list + count * 0x28 - 1)) return out;
+    for (uint32_t i = 0; i < count; i++) {
+        const uint32_t name = *reinterpret_cast<uint32_t*>(base + list + i * 0x28);
+        std::string s;
+        for (uint32_t k = 0; k < 64 && name >= 0x10000 && mem::IsCommitted(name + k) && base[name + k]; k++)
+            s += char(std::tolower(base[name + k]));
+        out.push_back(std::move(s));
+    }
+    return out;
+}
+
+// The Showroom rows a movie sets: every action block whose constant pool names ShowRoomNames, run straight through in
+// file order, the last assignment winning. Enough for these blocks (pushes, members, arrays and nothing that branches);
+// a block that branches or defines a function is left at that point.
+std::map<std::string, ShowroomRow> ShowroomOf(const std::string& f) {
+    struct Value {
+        int kind = 0;  // 0 a value, 1 _global, 2 one of _global's showroom arrays, 3 a new array, 4 anything else
+        std::string text;
+        std::vector<std::string> items;
+    };
+    std::map<std::string, std::vector<std::string>> arrays;
+    auto showroom = [](const std::string& name) {
+        return std::find_if(std::begin(kShowroom), std::end(kShowroom),
+                            [&](const char* s) { return name == s; }) != std::end(kShowroom);
+    };
+    auto number = [](double v) {
+        char buf[32];
+        std::snprintf(buf, sizeof buf, "%.9g", v);
+        return std::string(buf);
+    };
+    for (size_t at = f.find('\x88'); at != std::string::npos && at + 5 <= f.size(); at = f.find('\x88', at + 1)) {
+        const size_t len = uint8_t(f[at + 1]) | (uint8_t(f[at + 2]) << 8), n = uint8_t(f[at + 3]) | (uint8_t(f[at + 4]) << 8);
+        const size_t end = at + 3 + len;
+        if (!n || end > f.size()) continue;
+        std::vector<std::string> pool;
+        size_t q = at + 5;
+        for (size_t i = 0; i < n && q < end; i++) {
+            const size_t z = f.find('\0', q);
+            if (z == std::string::npos || z >= end) break;
+            pool.push_back(f.substr(q, z - q));
+            q = z + 1;
+        }
+        if (pool.size() != n || q != end || std::find(pool.begin(), pool.end(), "ShowRoomNames") == pool.end()) continue;
+        std::vector<Value> stack;
+        auto pop = [&] {
+            Value v;
+            if (!stack.empty()) v = std::move(stack.back()), stack.pop_back();
+            return v;
+        };
+        for (size_t p = end; p < f.size();) {
+            const uint8_t op = uint8_t(f[p++]);
+            if (!op) break;
+            size_t body = p, stop = p;
+            if (op >= 0x80) {
+                if (p + 2 > f.size()) break;
+                stop = p + 2 + (uint8_t(f[p]) | (uint8_t(f[p + 1]) << 8));
+                body = p + 2;
+                if (stop > f.size()) break;
+            }
+            p = stop;
+            if (op == 0x96) {
+                for (size_t b = body; b < stop;) {
+                    const uint8_t t = uint8_t(f[b++]);
+                    Value v;
+                    if (t == 0) {
+                        const size_t z = f.find('\0', b);
+                        if (z == std::string::npos || z >= stop) break;
+                        v.text = f.substr(b, z - b), b = z + 1;
+                    } else if (t == 1 && b + 4 <= stop) {
+                        float x;
+                        std::memcpy(&x, f.data() + b, 4), b += 4;
+                        v.text = number(x);
+                    } else if (t == 6 && b + 8 <= stop) {
+                        uint32_t w[2];
+                        std::memcpy(w, f.data() + b, 8), b += 8;
+                        const uint64_t bits = (uint64_t(w[0]) << 32) | w[1];  // AVM1 doubles are word-swapped
+                        double x;
+                        std::memcpy(&x, &bits, 8);
+                        v.text = number(x);
+                    } else if (t == 7 && b + 4 <= stop) v.text = std::to_string(int32_t(U32(f, b))), b += 4;
+                    else if (t == 8 && b < stop) v.text = uint8_t(f[b]) < pool.size() ? pool[uint8_t(f[b])] : "", b += 1;
+                    else if (t == 9 && b + 2 <= stop) {
+                        const size_t i = uint8_t(f[b]) | (uint8_t(f[b + 1]) << 8);
+                        v.text = i < pool.size() ? pool[i] : "", b += 2;
+                    } else if (t == 5 && b < stop) v.text = f[b] ? "true" : "false", b += 1;
+                    else if (t == 4 && b < stop) v.kind = 4, b += 1;
+                    else if (t == 2 || t == 3) v.kind = 4;
+                    else break;
+                    stack.push_back(std::move(v));
+                }
+            } else if (op == 0x1C) {  // GetVariable
+                Value v = pop();
+                v.kind = v.kind == 0 && v.text == "_global" ? 1 : 4;
+                stack.push_back(std::move(v));
+            } else if (op == 0x4E) {  // GetMember
+                Value name = pop(), object = pop();
+                Value v;
+                v.kind = object.kind == 1 && showroom(name.text) ? 2 : 4;
+                v.text = name.text;
+                stack.push_back(std::move(v));
+            } else if (op == 0x4F) {  // SetMember
+                Value value = pop(), name = pop(), object = pop();
+                if (object.kind == 1 && showroom(name.text)) {
+                    arrays[name.text] = value.kind == 3 ? std::move(value.items) : std::vector<std::string>();
+                } else if (object.kind == 2) {
+                    int32_t i;
+                    if (Int(name.text, i) && i >= 0 && i < 4096 && value.kind == 0) {
+                        std::vector<std::string>& a = arrays[object.text];
+                        if (a.size() <= size_t(i)) a.resize(size_t(i) + 1);
+                        a[size_t(i)] = value.text;
+                    }
+                }
+            } else if (op == 0x40 || op == 0x42) {  // NewObject(name, count, args) / InitArray(count, items)
+                const Value name = op == 0x40 ? pop() : Value{0, "Array", {}};
+                const Value count = pop();
+                int32_t c = 0;
+                Int(count.text, c);
+                Value v;
+                v.kind = name.text == "Array" ? 3 : 4;
+                for (int32_t i = 0; i < c && !stack.empty(); i++) v.items.push_back(pop().text);
+                int32_t length;  // new Array(n) is n empty entries
+                if (op == 0x40 && c == 1 && v.items.size() == 1 && Int(v.items[0], length) && length >= 0 &&
+                    length < 4096)
+                    v.items.assign(size_t(length), std::string());
+                stack.push_back(std::move(v));
+            } else if (op == 0x17) {  // Pop
+                pop();
+            } else if (op == 0x1D) {  // SetVariable
+                pop(), pop();
+            } else if (op == 0x99 || op == 0x9D || op == 0x9E || op == 0x9B || op == 0x8E || op == 0x94 || op == 0x8F) {
+                break;  // Jump, If, Call, DefineFunction(2), With, Try
+            }
+        }
+    }
+    std::map<std::string, ShowroomRow> out;
+    const std::vector<std::string>& names = arrays[kShowroom[0]];
+    for (size_t i = 0; i < names.size(); i++) {
+        if (names[i].empty()) continue;
+        ShowroomRow row(kShowroomFields);
+        for (size_t k = 0; k < kShowroomFields; k++) {
+            const std::vector<std::string>& a = arrays[kShowroom[k + 1]];
+            if (i < a.size()) row[k] = a[i];
+        }
+        out[Lower(names[i])] = std::move(row);
+    }
+    return out;
+}
+
+std::string ReadFile(const fs::path& p) {
+    std::ifstream in(p, std::ios::binary);
+    return {std::istreambuf_iterator<char>(in), {}};
+}
+
+// The Showroom arrays with the packs' cars, as statements to run after the movie's own; empty when nothing changes.
+std::vector<Statement> ShowroomStatements(const std::string& rel, const std::vector<Statement>& original,
+                                          std::vector<std::string>& dump) {
+    std::vector<Statement> cols;
+    for (const char* name : kShowroom) {
+        auto it = std::find_if(original.rbegin(), original.rend(),
+                               [&](const Statement& s) { return s.name == name && s.array; });
+        if (it == original.rend() || (!cols.empty() && it->values.size() != cols[0].values.size())) {
+            LOGE("MC3SHOWROOM %s: no %s array of the list's length; the Showroom is left as it is", rel.c_str(), name);
+            return {};
+        }
+        cols.push_back(*it);
+    }
+    // each pack's own garage movies, the Xbox one last so it wins
+    std::map<std::string, ShowroomRow> rows;
+    static const char* kMovies[] = {"flash\\toplevel.pck", "flash\\toplevel.xbck", "flash\\toplevel_x.pck",
+                                    "flash\\toplevel_x.xbck"};
+    std::error_code ec;
+    const bool add = Get().ShowroomPacks();  // else only the dump
+    for (const fs::path& root : add ? Mc3CarPackRoots() : std::vector<fs::path>())
+        for (const char* movie : kMovies) {
+            const fs::path p = root / movie;
+            if (!fs::is_regular_file(p, ec)) continue;
+            const std::map<std::string, ShowroomRow> got = ShowroomOf(ReadFile(p));
+            LOGE("MC3SHOWROOM %ls: %zu cars", p.c_str(), got.size());
+            for (const auto& [car, row] : got) rows[car] = row;
+        }
+    auto fill = [](ShowroomRow& into, const ShowroomRow& from) {
+        for (size_t k = 0; k < kShowroomFields; k++)
+            if (!from[k].empty()) into[k] = from[k];
+    };
+    std::map<std::string, ShowroomRow> scripted;
+    for (const auto& [car, row] : Get().Showroom()) {
+        auto [it, added] = scripted.emplace(car, ShowroomRow(kShowroomFields));
+        fill(it->second, row);
+    }
+    std::vector<std::string>& names = cols[0].values;
+    auto row_at = [&](size_t i) {
+        ShowroomRow r(kShowroomFields);
+        for (size_t k = 0; k < kShowroomFields; k++) r[k] = cols[k + 1].values[i];
+        return r;
+    };
+    auto set_at = [&](size_t i, const std::string& car, const ShowroomRow& r) {
+        if (i == names.size())
+            for (Statement& c : cols) c.values.emplace_back();
+        names[i] = car;
+        for (size_t k = 0; k < kShowroomFields; k++) cols[k + 1].values[i] = r[k];
+    };
+    bool changed = false;
+    for (size_t i = 0; i < names.size(); i++) {  // scripted changes to cars on the list
+        auto s = scripted.find(Lower(names[i]));
+        if (s == scripted.end()) continue;
+        ShowroomRow r = row_at(i);
+        fill(r, s->second);
+        set_at(i, names[i], r);
+        changed = true;
+    }
+    const std::vector<std::string> vehicles = add ? VehicleNames() : std::vector<std::string>();
+    std::set<std::string> listed;
+    for (const std::string& n : names) listed.insert(Lower(n));
+    size_t replaced = 0, appended = 0, moved = 0;
+    const size_t placeholders = size_t(std::count_if(names.begin(), names.end(), Placeholder));
+    for (size_t vi = 0; vi < vehicles.size(); vi++) {
+        const std::string& car = vehicles[vi];
+        if (car.empty() || listed.count(car) || Placeholder(car)) continue;
+        auto pack = rows.find(car);
+        auto s = scripted.find(car);
+        if (pack == rows.end() && s == scripted.end()) {
+            LOGE("MC3SHOWROOM %s: %s has no Showroom entry in its pack; give it a [showroom] row", rel.c_str(), car.c_str());
+            continue;
+        }
+        ShowroomRow r = pack != rows.end() ? pack->second : ShowroomRow(kShowroomFields);
+        if (s != scripted.end()) fill(r, s->second);
+        size_t at = names.size();
+        if (vi < names.size() && Placeholder(names[vi])) at = vi;
+        else if (vi != names.size()) {
+            auto free = std::find_if(names.begin(), names.end(), Placeholder);
+            if (free != names.end()) at = size_t(free - names.begin());
+            moved++;
+            LOGE("MC3SHOWROOM %s: %s is vehicle %zu but goes to Showroom entry %zu", rel.c_str(), car.c_str(), vi, at);
+        }
+        if (at == names.size() && names.size() >= kShowroomMax) {
+            LOGE("MC3SHOWROOM %s: %s left out, the Showroom holds %zu entries", rel.c_str(), car.c_str(), kShowroomMax);
+            continue;
+        }
+        (at == names.size() ? appended : replaced)++;
+        set_at(at, car, r);
+        listed.insert(car);
+        changed = true;
+    }
+    if (add && vehicles.empty()) LOGE("MC3SHOWROOM %s: the vehicle list is not loaded yet; no pack car added", rel.c_str());
+    if (add) LOGE("MC3SHOWROOM %s: %zu vehicles; %zu pack cars on %zu placeholders, %zu appended (%zu off their vehicle index), "
+         "%zu entries", rel.c_str(), vehicles.size(), replaced + appended, replaced, appended, moved, names.size());
+    for (size_t i = 0; i < names.size(); i++) {
+        if (Placeholder(names[i])) continue;
+        std::string line = names[i] + " =";
+        for (size_t k = 0; k < kShowroomFields; k++) line += (k ? ", " : " ") + Quote(cols[k + 1].values[i]);
+        dump.push_back(std::move(line));
+    }
+    const size_t left = size_t(std::count_if(names.begin(), names.end(), Placeholder));
+    if (rel == "flash\\toplevel_x.xbck") g_showroom_extra = int(placeholders - left);
+    if (!changed) return {};
+    return cols;
 }
 
 // A shop movie's init action as the game opened it, and what the script runs after it.
@@ -526,6 +906,12 @@ bool Mc3GarageAlias(const std::string& name, std::string& target) { return Get()
 
 bool Mc3GarageHasAliases() { return Get().HasAliases(); }
 
+// The garage movie while the Showroom takes the packs' cars: the game's own is run, a pack's is only Showroom data.
+bool Mc3GarageShowroomMovie(const std::string& rel) {
+    std::string shop, car;
+    return Get().ShowroomPacks() && ShopAndCar(rel, shop, car) && shop == "toplevel";
+}
+
 bool Mc3GarageScriptWants(const std::string& rel) {
     std::string shop, car;
     if (!Get().Active() || !ShopAndCar(rel, shop, car)) return false;
@@ -552,12 +938,17 @@ void Mc3GarageScriptSee(const std::string& rel, const std::string& file) {
     const std::vector<const Statement*> sts = Get().For(shop, car);
     std::vector<Statement> original;
     const bool decoded = Decode(file, a, original, error);
-    if (decoded) {
+    std::vector<Statement> showroom;
+    if (decoded && shop == "toplevel") {
+        std::vector<std::string> rows;
+        showroom = ShowroomStatements(rel, original, rows);
+        if (Get().Dump()) WriteShowroom(car, rows);
+    } else if (decoded) {
         if (Get().Dump()) WriteDump(shop, car, original);
     } else {
         LOGE("MC3GARAGE %s: not decoded (%s); no dump or automatic icon order", rel.c_str(), error.c_str());
     }
-    if (sts.empty()) return;
+    if (sts.empty() && showroom.empty()) return;
     Pending p;
     p.rel = rel;
     p.code = file.substr(a.code, a.end + 1 - a.code);
@@ -577,8 +968,9 @@ void Mc3GarageScriptSee(const std::string& rel, const std::string& file) {
     }
     if (decoded)
         for (const Statement& st : DeriveOrders(original, sts, rel)) p.extra += Compile(st);
+    for (const Statement& st : showroom) p.extra += Compile(st);
     p.extra += char(0);
-    LOGE("MC3GARAGE %s: %zu statements from the script", rel.c_str(), sts.size());
+    LOGE("MC3GARAGE %s: %zu statements from the script, %zu Showroom arrays", rel.c_str(), sts.size(), showroom.size());
     g_pending.push_back(std::move(p));
     g_any = true;
 }
@@ -643,4 +1035,15 @@ X86_FUNC(sub_00139590) {
         }
     }
     __imp__sub_00139590(ctx, base);
+}
+
+// 0x152420 sets XBliveCars (the Xbox Live car count, [0x557EAC]) on both garage movies through 0x139520 (movie
+// wrapper, name, value). With --mc3-showroom-packs it is raised by the placeholders pack cars took (g_showroom_extra).
+X86_EXTERN_FUNC(__imp__sub_00139520);
+
+X86_FUNC(sub_00139520) {
+    const uint32_t ret = X86_MEM32(ctx.esp);
+    if ((ret == 0x00153128 || ret == 0x00153136) && g_showroom_extra.load(std::memory_order_relaxed))
+        X86_MEM32(ctx.esp + 8) += uint32_t(g_showroom_extra.load(std::memory_order_relaxed));
+    __imp__sub_00139520(ctx, base);
 }
