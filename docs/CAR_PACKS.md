@@ -4,6 +4,10 @@ An opt-in way to **add** cars to the game from folders of loose files, for examp
 XBE or the game's archives. It is off unless asked for. Task MC3-0022; it builds on the PS2 car loader of
 `docs/PS2_CARS.md` (MC3-0021).
 
+"The VIP" in these documents is the VIP car pack (v1.0.2), a PS2 mod by Ibara, used to develop and test this
+support. The mod itself is not part of this repository: only the code that lets the Xbox game load such a pack is.
+Bring your own copy of the pack and point `--mc3-car-packs` at it.
+
 ## Turning it on
 
 ```text
