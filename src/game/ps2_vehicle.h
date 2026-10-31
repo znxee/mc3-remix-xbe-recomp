@@ -45,4 +45,11 @@ using Effects = std::map<std::string, int>;
 bool Convert(const std::vector<uint8_t>& file, const Effects& effects, std::vector<uint8_t>& body, uint32_t& base_va,
              uint32_t& type, Report& report, std::string& error);
 
+// Converts one drwShaderModel image from a PS2 page file. PPF entries carry a
+// 0x20-byte stream header before this body; callers pass the bytes after that
+// header and the entry's PS2 virtual base. This is separate from Convert()
+// because a page-file object has no PCK header of its own.
+bool ConvertShaderModel(const std::vector<uint8_t>& source, uint32_t source_base, const Effects& effects,
+                        std::vector<uint8_t>& body, Report& report, std::string& error);
+
 }  // namespace ps2veh
