@@ -61,7 +61,7 @@ X86_EXTERN_FUNC(__imp__sub_00210690);  // page manager: add fixed blocks (bytes,
 bool Mc3GarageScriptActive();  // garage_script.cpp, --mc3-garage-script
 bool Mc3GarageScriptWants(const std::string& rel);
 void Mc3GarageScriptSee(const std::string& rel, const std::string& file);
-bool Mc3GarageShowroomMovie(const std::string& rel);  // --mc3-showroom-packs
+bool Mc3GaragePackMovie(const std::string& rel);  // --mc3-showroom-packs, --mc3-pack-shops
 const ps2veh::Effects& Mc3Ps2Effects(uint8_t* base);  // ps2_car_loader.cpp
 const std::u16string* Mc3GarageString(const std::string& key);
 
@@ -566,6 +566,21 @@ public:
         return xbox;
     }
 
+    // A pack car's shop movie (flash\<shop>_<car>.xbck) that the game has no copy of, loose or in its archives.
+    bool MissingShopMovie(X86Context& ctx, uint8_t* base, const std::string& rel) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (auto it = missing_.find(rel); it != missing_.end()) return it->second;
+        const size_t dot = rel.rfind('.');
+        bool missing = false;
+        if (rel.size() > 9 && dot != std::string::npos && IsPackCar(rel.substr(9, dot - 9))) {
+            std::error_code ec;
+            const std::string loose = kernel::ResolvePath("D:\\" + rel, 0);
+            missing = (loose.empty() || !fs::is_regular_file(loose, ec)) && GameFile(ctx, base, rel).empty();
+        }
+        missing_[rel] = missing;
+        return missing;
+    }
+
 
 private:
     const fs::path* Find(const std::string& rel) const {
@@ -684,9 +699,17 @@ private:
             f = Find(pck);
             if (f) LOGE("MC3PACK %s: using PS2 %s", rel.c_str(), pck.c_str());
         }
-        if (f && Mc3GarageShowroomMovie(rel)) {  // the game's garage movie runs; the pack's gives Showroom entries
-            LOGE("MC3PACK %s: the game's own is used, the pack's is read for the Showroom", rel.c_str());
-            f = nullptr;
+        // The game runs its own copy of a movie it has, whatever is served: with --mc3-showroom-packs or
+        // --mc3-pack-shops the pack's copy is read for its menus (garage_script.cpp) instead.
+        std::string own;
+        if (f && Mc3GaragePackMovie(rel)) {
+            std::error_code ec;
+            const std::string loose = kernel::ResolvePath("D:\\" + rel, 0);
+            own = !loose.empty() && fs::is_regular_file(loose, ec) ? Read(loose) : GameFile(ctx, base, rel);
+            if (!own.empty()) {
+                LOGE("MC3PACK %s: the game's own is used, the pack's is read for its menus", rel.c_str());
+                f = nullptr;
+            }
         }
         static const char* kPrefixes[] = {"flash\\ds_", "flash\\ms_", "flash\\ps_", "flash\\vs_"};
         for (const char* pre : kPrefixes) {
@@ -705,6 +728,7 @@ private:
             std::error_code ec;
             const std::string loose = kernel::ResolvePath("D:\\" + source, 0);
             if (f) file = Read(*f);
+            else if (!own.empty()) file = std::move(own);
             else if (!loose.empty() && fs::is_regular_file(loose, ec)) file = Read(loose);
             else file = GameFile(ctx, base, source);
             Mc3GarageScriptSee(rel, file);
@@ -712,6 +736,8 @@ private:
         if (f) return Write(rel, Read(*f));
         return source == rel ? std::string() : "D:\\" + source;
     }
+
+    std::map<std::string, bool> missing_;
 
     bool IsPackCar(const std::string& car) const {
         for (const Pack& p : packs_)
@@ -871,6 +897,12 @@ std::vector<std::filesystem::path> Mc3CarPackVehicleFolders() { return Get().Veh
 
 // The packs' folders, for garage_script.cpp (a pack's garage.txt).
 std::vector<std::filesystem::path> Mc3CarPackRoots() { return Get().Roots(); }
+
+// For garage_script.cpp: a pack car's shop movie the game does not have (`rel` is flash\<shop>_<car>.xbck).
+bool Mc3CarPackMissingShopMovie(X86Context& ctx, uint8_t* base, const std::string& rel) {
+    Packs& packs = Get();
+    return !packs.Empty() && packs.MissingShopMovie(ctx, base, rel);
+}
 
 // Page files do not use Stream::Open: 0x212100 calls the asset manager directly, then retains its first argument for
 // asynchronous page-ins.  Rewrite that one bootstrap argument so the original page manager opens the generated cache

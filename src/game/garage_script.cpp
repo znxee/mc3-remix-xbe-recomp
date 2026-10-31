@@ -51,6 +51,7 @@
 #include <vector>
 
 std::vector<std::filesystem::path> Mc3CarPackRoots();  // car_packs.cpp
+bool Mc3CarPackMissingShopMovie(X86Context& ctx, uint8_t* base, const std::string& rel);
 
 namespace {
 
@@ -229,6 +230,7 @@ public:
     Script() {
         dump_ = Mc3DebugHasArg(L"--mc3-garage-dump");
         showroom_packs_ = Mc3DebugHasArg(L"--mc3-showroom-packs");
+        pack_shops_ = Mc3DebugHasArg(L"--mc3-pack-shops");
         const bool enabled = Mc3DebugHasArg(L"--mc3-garage-script");
         std::vector<fs::path> files;
         if (const wchar_t* v = Mc3DebugArg(L"--mc3-garage-script"); v && *v) files.emplace_back(v);
@@ -253,10 +255,11 @@ public:
     }
 
     bool Active() const {
-        return dump_ || showroom_packs_ || !sections_.empty() || !strings_.empty() || !aliases_.empty();
+        return dump_ || showroom_packs_ || pack_shops_ || !sections_.empty() || !strings_.empty() || !aliases_.empty();
     }
 
     bool ShowroomPacks() const { return showroom_packs_; }
+    bool PackShops() const { return pack_shops_; }
 
     // [showroom] rows, in script order (a later one wins field by field)
     const std::vector<std::pair<std::string, ShowroomRow>>& Showroom() const { return showroom_; }
@@ -278,6 +281,7 @@ public:
     bool Wants(const std::string& shop, const std::string& car) const {
         if (dump_) return true;
         if (shop == "toplevel") return showroom_packs_;
+        if (pack_shops_) return true;
         for (const Section& s : sections_)
             if (s.shop == shop && (s.car == "*" || s.car == car)) return true;
         return false;
@@ -298,6 +302,7 @@ public:
 private:
     bool dump_ = false;
     bool showroom_packs_ = false;
+    bool pack_shops_ = false;
     std::vector<std::pair<std::string, ShowroomRow>> showroom_;
     std::vector<Section> sections_;
     std::map<std::string, std::u16string> strings_;
@@ -634,20 +639,18 @@ std::vector<std::string> VehicleNames() {
     return out;
 }
 
-// The Showroom rows a movie sets: every action block whose constant pool names ShowRoomNames, run straight through in
-// file order, the last assignment winning. Enough for these blocks (pushes, members, arrays and nothing that branches);
-// a block that branches or defines a function is left at that point.
-std::map<std::string, ShowroomRow> ShowroomOf(const std::string& f) {
+// The _global arrays a movie sets (those `wanted` accepts): every action block whose constant pool names `word`, run
+// straight through in file order, the last assignment winning. A PS2 mod's movie keeps the original init action and
+// rebuilds arrays element by element in blocks appended later (VIP). Enough for these blocks (pushes, members, arrays
+// and nothing that branches); a block that branches or defines a function is left at that point.
+std::map<std::string, std::vector<std::string>> MovieArrays(const std::string& f, const char* word,
+                                                            bool (*wanted)(const std::string&)) {
     struct Value {
-        int kind = 0;  // 0 a value, 1 _global, 2 one of _global's showroom arrays, 3 a new array, 4 anything else
+        int kind = 0;  // 0 a value, 1 _global, 2 one of _global's wanted arrays, 3 a new array, 4 anything else
         std::string text;
         std::vector<std::string> items;
     };
     std::map<std::string, std::vector<std::string>> arrays;
-    auto showroom = [](const std::string& name) {
-        return std::find_if(std::begin(kShowroom), std::end(kShowroom),
-                            [&](const char* s) { return name == s; }) != std::end(kShowroom);
-    };
     auto number = [](double v) {
         char buf[32];
         std::snprintf(buf, sizeof buf, "%.9g", v);
@@ -665,7 +668,7 @@ std::map<std::string, ShowroomRow> ShowroomOf(const std::string& f) {
             pool.push_back(f.substr(q, z - q));
             q = z + 1;
         }
-        if (pool.size() != n || q != end || std::find(pool.begin(), pool.end(), "ShowRoomNames") == pool.end()) continue;
+        if (pool.size() != n || q != end || std::find(pool.begin(), pool.end(), word) == pool.end()) continue;
         std::vector<Value> stack;
         auto pop = [&] {
             Value v;
@@ -720,12 +723,12 @@ std::map<std::string, ShowroomRow> ShowroomOf(const std::string& f) {
             } else if (op == 0x4E) {  // GetMember
                 Value name = pop(), object = pop();
                 Value v;
-                v.kind = object.kind == 1 && showroom(name.text) ? 2 : 4;
+                v.kind = object.kind == 1 && wanted(name.text) ? 2 : 4;
                 v.text = name.text;
                 stack.push_back(std::move(v));
             } else if (op == 0x4F) {  // SetMember
                 Value value = pop(), name = pop(), object = pop();
-                if (object.kind == 1 && showroom(name.text)) {
+                if (object.kind == 1 && wanted(name.text)) {
                     arrays[name.text] = value.kind == 3 ? std::move(value.items) : std::vector<std::string>();
                 } else if (object.kind == 2) {
                     int32_t i;
@@ -757,6 +760,17 @@ std::map<std::string, ShowroomRow> ShowroomOf(const std::string& f) {
             }
         }
     }
+    return arrays;
+}
+
+bool ShowroomArray(const std::string& name) {
+    return std::find_if(std::begin(kShowroom), std::end(kShowroom), [&](const char* s) { return name == s; }) !=
+           std::end(kShowroom);
+}
+
+// The Showroom rows a movie sets, by car.
+std::map<std::string, ShowroomRow> ShowroomOf(const std::string& f) {
+    std::map<std::string, std::vector<std::string>> arrays = MovieArrays(f, "ShowRoomNames", ShowroomArray);
     std::map<std::string, ShowroomRow> out;
     const std::vector<std::string>& names = arrays[kShowroom[0]];
     for (size_t i = 0; i < names.size(); i++) {
@@ -881,9 +895,47 @@ std::vector<Statement> ShowroomStatements(const std::string& rel, const std::vec
     return cols;
 }
 
+// --mc3-pack-shops: a car pack's shop movie for a car the game has its own movie for (a PS2 mod's ds_, ms_, ps_ or
+// vs_ of a retail car) is not what the game runs, so its menus are read from it and run after the game's init action:
+// every array of that init action the pack's movie ends up with different. The pack's movie (flash\<shop>_<car>.xbck
+// or .pck, the last pack that has one) is read straight through like the Showroom's; plain values are left out (later
+// blocks set runtime values, not menus). A new car's own pack movie is the one the game runs, and needs nothing.
+bool AnyArray(const std::string&) { return true; }
+
+std::vector<Statement> PackShopStatements(const std::string& rel, const std::string& running,
+                                          const std::vector<Statement>& original) {
+    const std::string stem = rel.substr(6, rel.rfind('.') - 6);  // "flash\ds_vp_x.xbck" -> ds_vp_x
+    std::string movie;
+    fs::path from;
+    std::error_code ec;
+    for (const fs::path& root : Mc3CarPackRoots())
+        for (const char* ext : {".xbck", ".pck"}) {
+            const fs::path p = root / "flash" / (stem + ext);
+            if (fs::is_regular_file(p, ec)) from = p;
+        }
+    if (from.empty()) return {};
+    movie = ReadFile(from);
+    if (movie == running) return {};  // the game runs the pack's own movie
+    const std::map<std::string, std::vector<std::string>> arrays = MovieArrays(movie, "_global", AnyArray);
+    std::vector<Statement> out;
+    std::set<std::string> seen;
+    for (auto it = original.rbegin(); it != original.rend(); ++it) {
+        if (!it->array || !seen.insert(it->name).second) continue;
+        auto pack = arrays.find(it->name);
+        if (pack == arrays.end() || pack->second == it->values) continue;
+        Statement st = *it;
+        st.values = pack->second;
+        out.push_back(std::move(st));
+    }
+    std::reverse(out.begin(), out.end());
+    LOGE("MC3GARAGE %s: %zu menu arrays from %ls", rel.c_str(), out.size(), from.c_str());
+    return out;
+}
+
 // A shop movie's init action as the game opened it, and what the script runs after it.
 struct Pending {
-    std::string rel;
+    std::string rel;     // the movie the game asked for (a new car's, when a stand-in runs for it)
+    bool stand_in = false;
     std::string code;   // the movie's own actions, through ActionEnd
     std::string extra;  // sprite id, the script's statements, ActionEnd
     uint32_t guest = 0; // `extra` in guest memory, kept: pushed strings are referenced, not copied
@@ -893,6 +945,12 @@ struct Pending {
 std::mutex g_mutex;
 std::vector<Pending> g_pending;
 std::string g_active_rel;
+// A new car's shop movie the game does not have is loaded under a stock car's name (sub_00139500): that name, and the
+// movie it stands in for.
+std::string g_stand_in, g_stand_in_for;
+
+// The movie `rel` is opened for (g_mutex held).
+const std::string& Requested(const std::string& rel) { return rel == g_stand_in ? g_stand_in_for : rel; }
 std::atomic<bool> g_any{false};  // the interpreter runs every frame: nothing to look for until a movie is seen
 
 }  // namespace
@@ -906,10 +964,12 @@ bool Mc3GarageAlias(const std::string& name, std::string& target) { return Get()
 
 bool Mc3GarageHasAliases() { return Get().HasAliases(); }
 
-// The garage movie while the Showroom takes the packs' cars: the game's own is run, a pack's is only Showroom data.
-bool Mc3GarageShowroomMovie(const std::string& rel) {
+// A movie whose pack copy is read for its menus (--mc3-showroom-packs: the garage movie; --mc3-pack-shops: a shop
+// movie) rather than served, when the game has its own: car_packs.cpp then lets the game open its own.
+bool Mc3GaragePackMovie(const std::string& rel) {
     std::string shop, car;
-    return Get().ShowroomPacks() && ShopAndCar(rel, shop, car) && shop == "toplevel";
+    if (!ShopAndCar(rel, shop, car)) return false;
+    return shop == "toplevel" ? Get().ShowroomPacks() : Get().PackShops();
 }
 
 bool Mc3GarageScriptWants(const std::string& rel) {
@@ -917,16 +977,18 @@ bool Mc3GarageScriptWants(const std::string& rel) {
     if (!Get().Active() || !ShopAndCar(rel, shop, car)) return false;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        g_active_rel = rel;
+        g_active_rel = Requested(rel);
+        ShopAndCar(g_active_rel, shop, car);
     }
     return Get().Wants(shop, car);
 }
 
 // `file` is the movie the game is opening for `rel` (lowercase, relative to the assets).
-void Mc3GarageScriptSee(const std::string& rel, const std::string& file) {
+void Mc3GarageScriptSee(const std::string& opened, const std::string& file) {
     std::string shop, car;
-    if (!ShopAndCar(rel, shop, car)) return;
     std::lock_guard<std::mutex> lock(g_mutex);
+    const std::string rel = Requested(opened);  // a stand-in's statements are the new car's
+    if (!ShopAndCar(rel, shop, car)) return;
     for (const Pending& p : g_pending)
         if (p.rel == rel) return;
     Action a;
@@ -938,7 +1000,8 @@ void Mc3GarageScriptSee(const std::string& rel, const std::string& file) {
     const std::vector<const Statement*> sts = Get().For(shop, car);
     std::vector<Statement> original;
     const bool decoded = Decode(file, a, original, error);
-    std::vector<Statement> showroom;
+    std::vector<Statement> showroom, pack;
+    if (decoded && shop != "toplevel" && Get().PackShops()) pack = PackShopStatements(rel, file, original);
     if (decoded && shop == "toplevel") {
         std::vector<std::string> rows;
         showroom = ShowroomStatements(rel, original, rows);
@@ -948,11 +1011,13 @@ void Mc3GarageScriptSee(const std::string& rel, const std::string& file) {
     } else {
         LOGE("MC3GARAGE %s: not decoded (%s); no dump or automatic icon order", rel.c_str(), error.c_str());
     }
-    if (sts.empty() && showroom.empty()) return;
+    if (sts.empty() && showroom.empty() && pack.empty()) return;
     Pending p;
     p.rel = rel;
+    p.stand_in = rel != opened;
     p.code = file.substr(a.code, a.end + 1 - a.code);
     p.extra = file.substr(a.block, 2);
+    for (const Statement& st : pack) p.extra += Compile(st);  // before the script's, so the script wins
     for (const Statement* st : sts) {
         Statement compiled = *st;
         if (shop == "vs" && compiled.array && compiled.name == "RimsStatus" && decoded) {
@@ -970,7 +1035,8 @@ void Mc3GarageScriptSee(const std::string& rel, const std::string& file) {
         for (const Statement& st : DeriveOrders(original, sts, rel)) p.extra += Compile(st);
     for (const Statement& st : showroom) p.extra += Compile(st);
     p.extra += char(0);
-    LOGE("MC3GARAGE %s: %zu statements from the script, %zu Showroom arrays", rel.c_str(), sts.size(), showroom.size());
+    LOGE("MC3GARAGE %s: %zu statements from the script, %zu Showroom arrays, %zu pack menu arrays", rel.c_str(),
+         sts.size(), showroom.size(), pack.size());
     g_pending.push_back(std::move(p));
     g_any = true;
 }
@@ -984,14 +1050,22 @@ X86_FUNC(sub_00068BC0) {
     uint32_t extra = 0;
     if (g_any.load(std::memory_order_relaxed) && data >= 0x10000 && base[data + 2] == 0x88 && std::memcmp(base + data + 7, "_global", 8) == 0) {
         std::lock_guard<std::mutex> lock(g_mutex);
-        for (Pending& p : g_pending)
-            if (std::memcmp(base + data + 2, p.code.data(), p.code.size()) == 0) {
-                g_active_rel = p.rel;
-                if (!p.guest && (p.guest = mem::AllocSystem(uint32_t(p.extra.size()), 16)))
-                    std::memcpy(base + p.guest, p.extra.data(), p.extra.size());
-                extra = p.guest;
-                break;
-            }
+        // A stand-in shares its init action with the stock car's own movie: it matches only while it is the movie
+        // the game opened last; any other movie matches by its code alone.
+        Pending* match = nullptr;
+        for (int pass = 0; pass < 2 && !match; pass++)
+            for (Pending& p : g_pending)
+                if ((pass == 0 ? p.rel == g_active_rel : !p.stand_in) &&
+                    std::memcmp(base + data + 2, p.code.data(), p.code.size()) == 0) {
+                    match = &p;
+                    break;
+                }
+        if (Pending* p = match) {
+            g_active_rel = p->rel;
+            if (!p->guest && (p->guest = mem::AllocSystem(uint32_t(p->extra.size()), 16)))
+                std::memcpy(base + p->guest, p->extra.data(), p->extra.size());
+            extra = p->guest;
+        }
     }
     __imp__sub_00068BC0(ctx, base);
     if (!extra) return;
@@ -1046,4 +1120,39 @@ X86_FUNC(sub_00139520) {
     if ((ret == 0x00153128 || ret == 0x00153136) && g_showroom_extra.load(std::memory_order_relaxed))
         X86_MEM32(ctx.esp + 8) += uint32_t(g_showroom_extra.load(std::memory_order_relaxed));
     __imp__sub_00139520(ctx, base);
+}
+
+// The garage names the shop movie it loads with "<shop>_%s.swf" and the car (0x14E8E0 -> 0x139500, which copies the name
+// into the movie wrapper). The Flash loader finds a movie only among the game's own: a new car of a car pack gets an empty
+// shop with no menu, whatever is served for it. Its shops run the stock car's movie instead (with --mc3-pack-shops,
+// carrying the menus of the car's own pack movie); log once per movie.
+constexpr char kStandInCar[] = "vp_jetta_03";
+
+X86_EXTERN_FUNC(__imp__sub_00139500);
+
+X86_FUNC(sub_00139500) {
+    const uint32_t name = X86_MEM32(ctx.esp + 4);
+    std::string movie;
+    for (uint32_t i = 0; i < 80 && name >= 0x10000 && mem::IsCommitted(name + i) && base[name + i]; i++)
+        movie += char(std::tolower(base[name + i]));
+    std::string shop, car;
+    const size_t n = movie.size();
+    const std::string rel = n > 4 && movie.compare(n - 4, 4, ".swf") == 0 ? "flash\\" + movie.substr(0, n - 4) + ".xbck" : "";
+    if (!rel.empty() && ShopAndCar(rel, shop, car)) {
+        const bool stand_in = shop != "toplevel" && car != kStandInCar && Mc3CarPackMissingShopMovie(ctx, base, rel);
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (stand_in) {
+            static uint32_t buffer = mem::AllocSystem(64, 16);
+            const std::string sub = shop + "_" + kStandInCar + ".swf";
+            std::memcpy(base + buffer, sub.c_str(), sub.size() + 1);
+            X86_MEM32(ctx.esp + 4) = buffer;
+            g_stand_in = "flash\\" + shop + "_" + kStandInCar + ".xbck";
+            g_stand_in_for = g_active_rel = rel;
+            static std::set<std::string> told;
+            if (told.insert(rel).second) LOGE("MC3GARAGE %s: the game has no such movie; %s's runs for it", rel.c_str(), kStandInCar);
+        } else {
+            g_stand_in.clear(), g_stand_in_for.clear();
+        }
+    }
+    __imp__sub_00139500(ctx, base);
 }

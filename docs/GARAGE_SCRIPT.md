@@ -10,6 +10,7 @@ they are available. It is off unless asked for. Task MC3-0023; it works with or 
 | --- | --- | --- |
 | `--mc3-garage-script=<file>` | off | Runs `<file>` on the shop menus. A car pack's own `garage.txt` (at its root) is run too. |
 | `--mc3-garage-dump` | off | Writes every shop menu the game opens, as script, to `hdd\Z\carpacks\garage_dump\<shop>_<car>.txt`. |
+| `--mc3-pack-shops` | off | Retail cars' shops take a car pack's menus (see "Pack shops" below). |
 
 The dump is the starting point: turn it on, enter the shops of a car in the garage, and copy what you want to change
 from the files it writes.
@@ -232,6 +233,64 @@ Integration build, legacy profile, Player 1 of the `existing` save on an isolate
 * Without the flag the same pack gave the retail list and no `MC3SHOWROOM` line.
 * Not checked: saving and reloading a profile with a bought pack car, Manage Vehicles with it, and a career race with
   it (the VIP cars were driven in Arcade before, MC3-0028).
+
+## Pack shops: a mod's menus for the retail cars
+
+| Flag | Default | What it does |
+| --- | --- | --- |
+| `--mc3-pack-shops` | off | A retail car's shops take the menus of a car pack's own shop movies. |
+
+A PS2 mod such as the VIP ships `flash\{ds,ms,ps,vs}_<car>.pck` for the retail cars too, with its own menus: more
+rims and rim sizes, extra hoods and plates, a Trim item in the Paint Shop. The game runs its own Xbox movie for a car it
+has, so a served pack movie never shows. With the flag the pack's movie is read instead of served, and the arrays of
+the game's init action that the pack's movie ends up with different are run after it (the garage script's mechanism):
+
+* The pack's movie is read like the Showroom's: every action block whose constant pool names `_global`, in file order,
+  the last assignment winning. The VIP keeps each movie's original init action and rebuilds the lists element by
+  element in blocks appended at the end of the file.
+* Only arrays that the game's own init action sets are changed; plain values are left out (later blocks set runtime
+  values such as `Description`). A list keeps the movie's integer type.
+* The script's own statements (`--mc3-garage-script`, `garage.txt`) run after the pack's, so they win.
+* A new car (one the game has no shop movies for) runs a stock car's movies instead, see below; with the flag they carry
+  the menus of the new car's own pack movies.
+
+The log says `MC3PACK flashs_vp_srt4_04.xbck: the game's own is used, the pack's is read for its menus`, then
+`MC3GARAGE flashs_vp_srt4_04.xbck: 11 menu arrays from <pack movie>`.
+
+What the Xbox game does with an added item is its own: the names have to be ones it knows. The VIP's checked ones are
+(`rim_14`..`rim_28` are in a table at `0x471BC8`, `Trim` is handled by the paint menu at `0x14EF90`, rims come from the
+merged `customwheels.txt`, parts from the pack's PS2 car files). Brand logos in a ring are positional like the shops'
+icons, so an added rim shows the logo of the last retail entry.
+
+### How the pack shops were checked
+
+Legacy profile, Player 1 (SRT4) of the `existing` save on `hdd6`, the VIP pack v1.0.2, `--mc3-pack-shops`
+(`garage_tools/MC3-0028/shops_probe.py`):
+
+* Visual > Wheels > Rims: 91 entries instead of 69; going left from the stock rim reached OZ Opera, Iforged Daytona and
+  Concept, Advan RGII, showing `Locked` as retail rims do at that progress.
+* Rim Size: `rim_14` to `rim_28` instead of 15 to 20; 28" showed `Unavailable` for the SRT4.
+* Paint: the root ring is Paint ... Nitrous Color, Trim, Hud; Trim opened its colour ring (`chrome`).
+* Detail: the plate list took the VIP's 81 entries (the log; `japan_tokyo_1` is outside the walked ring).
+* The Showroom (`--mc3-showroom-packs`) still listed all 122 entries.
+* Without the flag the same shops kept the retail lists (rims from Grac and GFG, sizes 15-20, no Trim) and the log had
+  no `menu arrays` line. No `exception` or `KeBugCheck` in any run.
+* Not checked: buying or installing an added item.
+
+### A new car's shops
+
+The garage loads a shop movie by name, `<shop>_<car>.swf` (`0x14E8E0` -> `0x139500`, which copies the name into the
+movie wrapper), and the Flash loader finds a movie only among the game's own: a new car of a car pack got a shop with
+no menu at all, whatever was served for it (its PS2 movie, or the Jetta's under its name). With car packs, a shop movie
+the game does not have (loose or in its archives) for a pack car is now loaded as the stock Jetta's
+(`MC3GARAGE flashs_vp_d_golf_83.xbck: the game has no such movie; vp_jetta_03's runs for it`). The garage script and
+`--mc3-pack-shops` still treat it as the new car's movie: script sections and the pack's menus are the new car's, and
+the Jetta's own shops are left alone (a stand-in's statements run only while it is the movie the game opened last).
+
+Checked with the VIP Golf GTI bought in the Showroom: before, all four shops opened empty; now Performance (Engine),
+Detail (Vinyls), Paint and Visual (Body Upgrades) open, and with `--mc3-pack-shops` the rim ring starts with the
+Golf's own stock rim and has the VIP rims; without it the Jetta's lists show. The footer logo is positional (it showed
+Mitsubishi). Not checked: buying or installing a part on a new car; a new motorbike would get a car's shop movies.
 
 ## How it was checked
 
