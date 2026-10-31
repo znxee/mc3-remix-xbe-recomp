@@ -1175,9 +1175,11 @@ X86_FUNC(sub_001A2280) {
 // ($/resources/city/losangeles_..., paris_..., tokyo_mc2_...) redirect to San Diego ("sd") resources,
 // providing the base lighting, sky, and weather pack without returning NULL and crashing.
 void Mc3TraceResource(const char* how, X86Context& ctx, uint8_t* base);  // car_late_load.cpp, --mc3-trace-resources
+bool Mc3Ps2CarLoad(X86Context& ctx, uint8_t* base);  // ps2_car_loader.cpp, --mc3-ps2-cars
 
 X86_FUNC(sub_002105F0) {
     Mc3TraceResource("load", ctx, base);
+    if (Mc3Ps2CarLoad(ctx, base)) return;
     if (g_enabled) {
         uint32_t name_va = X86_MEM32(ctx.esp + 4);
         if (name_va) {
