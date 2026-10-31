@@ -549,7 +549,11 @@ public:
     // the host file standing in for `rel`, written on first use; empty to let the game open its own
     std::string Serve(X86Context& ctx, uint8_t* base, const std::string& rel) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (auto it = served_.find(rel); it != served_.end()) return it->second;
+        if (auto it = served_.find(rel); it != served_.end()) {
+            // A cached shop can become active again after another car or shop was opened.
+            if (Mc3GarageScriptActive() && rel.rfind("flash\\", 0) == 0) Mc3GarageScriptWants(rel);
+            return it->second;
+        }
         std::string xbox;
         if (kMerged.count(rel)) xbox = Merge(ctx, base, rel);
         else if (rel == "resources\\vehicle\\decal.xbck" || rel == "resources\\vehicle\\decal_g.xbck")
