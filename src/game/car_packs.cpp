@@ -52,6 +52,10 @@ X86_EXTERN_FUNC(sub_000EC580);  // hash table lookup (ecx = table, hash) -> entr
 X86_EXTERN_FUNC(sub_001B3B90);  // operator new
 X86_EXTERN_FUNC(__imp__sub_000EA750);
 
+bool Mc3GarageScriptActive();  // garage_script.cpp, --mc3-garage-script
+bool Mc3GarageScriptWants(const std::string& rel);
+void Mc3GarageScriptSee(const std::string& rel, const std::string& file);
+
 namespace {
 
 namespace fs = std::filesystem;
@@ -235,6 +239,12 @@ public:
         LOGE("MC3PACK pack %ls: %zu strings", p.root.c_str(), strings_.size() - before);
     }
 
+    std::vector<fs::path> Roots() const {
+        std::vector<fs::path> out;
+        for (const Pack& p : packs_) out.push_back(p.root);
+        return out;
+    }
+
     std::vector<fs::path> VehicleFolders() const {
         std::vector<fs::path> out;
         std::error_code ec;
@@ -249,7 +259,7 @@ public:
         if (auto it = served_.find(rel); it != served_.end()) return it->second;
         std::string xbox;
         if (kMerged.count(rel)) xbox = Merge(ctx, base, rel);
-        else if (rel.rfind("flash\\", 0) == 0) xbox = Flash(rel);
+        else if (rel.rfind("flash\\", 0) == 0) xbox = Flash(ctx, base, rel);
         else if (rel.rfind("fonts\\", 0) == 0) xbox.clear();  // string sources, read above, never served
         else if (const fs::path* f = Find(rel)) xbox = Copy(rel, *f);
         served_[rel] = xbox;
@@ -334,23 +344,34 @@ private:
         return Write(rel, out);
     }
 
-    // A new car's front-end images: the pack's own when it has Xbox ones, else a stock car's.
-    std::string Flash(const std::string& rel) {
-        if (const fs::path* f = Find(rel)) return Write(rel, Read(*f));
+    // A car's shop movies (flash\ds_, ms_, ps_, vs_): the pack's own when it has Xbox ones, else the game's, else a
+    // stock car's for a new car. The garage script (garage_script.cpp) is shown the movie the game will run.
+    std::string Flash(X86Context& ctx, uint8_t* base, const std::string& rel) {
+        std::string source = rel;
+        const fs::path* f = Find(rel);
         static const char* kPrefixes[] = {"flash\\ds_", "flash\\ms_", "flash\\ps_", "flash\\vs_"};
         for (const char* pre : kPrefixes) {
             const size_t n = std::strlen(pre);
-            if (rel.compare(0, n, pre) != 0) continue;
+            if (f || rel.compare(0, n, pre) != 0) continue;
             const std::string car = rel.substr(n, rel.rfind('.') - n);
-            if (!IsPackCar(car)) return {};
-            const std::string stock = std::string("D:\\") + pre + kFallbackCar + rel.substr(rel.rfind('.'));
+            if (!IsPackCar(car)) break;
             std::error_code ec;
             const std::string own = kernel::ResolvePath(std::string("D:\\") + rel, 0);
-            if (!own.empty() && fs::exists(own, ec)) return {};
+            if (!own.empty() && fs::exists(own, ec)) break;
             LOGE("MC3PACK %s: no image for this car, %s's is shown", rel.c_str(), kFallbackCar);
-            return stock;
+            source = pre + std::string(kFallbackCar) + rel.substr(rel.rfind('.'));
         }
-        return {};
+        if (Mc3GarageScriptWants(rel)) {  // the script's statements will run after this movie's own
+            std::string file;  // flash\ is loose on the game's drive; the archives are the fallback
+            std::error_code ec;
+            const std::string loose = kernel::ResolvePath("D:\\" + source, 0);
+            if (f) file = Read(*f);
+            else if (!loose.empty() && fs::is_regular_file(loose, ec)) file = Read(loose);
+            else file = GameFile(ctx, base, source);
+            Mc3GarageScriptSee(rel, file);
+        }
+        if (f) return Write(rel, Read(*f));
+        return source == rel ? std::string() : "D:\\" + source;
     }
 
     bool IsPackCar(const std::string& car) const {
@@ -479,11 +500,14 @@ uint32_t PathSlot(uint8_t* base, const std::string& path) {
 // Folders of PS2 car files the packs bring, for ps2_car_loader.cpp.
 std::vector<std::filesystem::path> Mc3CarPackVehicleFolders() { return Get().VehicleFolders(); }
 
+// The packs' folders, for garage_script.cpp (a pack's garage.txt).
+std::vector<std::filesystem::path> Mc3CarPackRoots() { return Get().Roots(); }
+
 // Called first by Mc2LaPaths (Stream::Open, 0x1A2280). true when the path now names a file the console's file system
 // opens (the caller switches Stream::Open to that device for this call).
 bool Mc3CarPackOpen(X86Context& ctx, uint8_t* base) {
     Packs& packs = Get();
-    if (packs.Empty() || Packs::Reading()) return false;
+    if ((packs.Empty() && !Mc3GarageScriptActive()) || Packs::Reading()) return false;
     const uint32_t va = X86_MEM32(ctx.esp + 4);
     if (!va) return false;
     const char* p = reinterpret_cast<const char*>(base + va);

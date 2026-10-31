@@ -27,6 +27,7 @@ as it ships. Only what a pack holds matters, for example for one car:
 <pack>\resources\vehicle\<car>\*.pck                 the PS2 car files (converted at load time, see PS2_CARS.md)
 <pack>\fonts\*.strtbl                                names and texts, read as string sources
 <pack>\strings.txt                                   names and texts, one "key = text" per line (UTF-8)
+<pack>\garage.txt                                    the garage shops' menus for its cars (docs/GARAGE_SCRIPT.md)
 ```
 
 `strings.txt` is the easy way to name a car: the menus ask for `<car>_short` (the label) among others.
