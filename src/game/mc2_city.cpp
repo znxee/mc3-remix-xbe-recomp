@@ -11,7 +11,13 @@
 // count (the packet's adjuncts) and that many B8G8R8A8 colours, one per adjunct. A material's second texture (lit
 // windows) is added with the second texture coordinates. Collision: Mc2LaBound, at the end.
 //
-// Settings, environment: MC3_MC2_DIR (on), MC3_MC2_TIME (cpvs and fog, default midnight_clear), MC3_MC2_LIGHT (scale of
+// Time and weather: the city follows what MC3 resolved for the race or cruise (Mc2NoteConditions); the cpvs, the fog and the
+// sky (city/<city>/<time>/sky_*.xmod, the skyhat's m_clearColor behind it) are MC2's for that time. MC3's own sky is not
+// drawn in the main scene (Extension::SkipDraw). The frame's alpha is MC3's glow mask, so the city and the sky leave it clear.
+//
+// Settings, environment: MC3_MC2_DIR (on), MC3_MC2_TIME (forces one time and weather, e.g. dusk_rainy; default: MC3's),
+// MC3_MC2_SKY=0 (MC3's own sky), MC3_MC2_ALPHA (what the city leaves in the frame's alpha, default 0),
+// MC3_MC2_SKYDEBUG (scales the sky's brightness), MC3_MC2_LIGHT (scale of
 // the lighting, default 1), MC3_MC2_LOD (metres to LOD 1, default 150), MC3_MC2_ALWAYS=1 (Los Angeles in place of any
 // city), MC3_MC2_TELEPORT (F6, see Teleport), MC3_MC2_TRACE (logs every file opened).
 
@@ -28,6 +34,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -151,6 +158,39 @@ int FindMc2CityByRecord(uint32_t rec) {
     return -1;
 }
 bool IsMc2Record(uint32_t rec) { return FindMc2CityByRecord(rec) >= 0; }
+
+// MC2's time of day and weather ("dawn_clear"), as MC3 resolved them for the race or cruise: the game asks for
+// $/resources/city/<city>_<time>_<weather> when it loads the city, whatever set the time (the race's own, the Arcade
+// menu). One authority for the cpvs, the fog, the textures and the sky, so the city and MC3's own scene agree.
+std::mutex g_mc2_conditions_mutex;
+std::string g_mc2_conditions;
+std::string Mc2Conditions() {
+    std::lock_guard<std::mutex> lock(g_mc2_conditions_mutex);
+    return g_mc2_conditions;
+}
+void Mc2NoteConditions(const char* resource) {
+    std::string low(resource);
+    for (auto& ch : low) ch = ch == '\\' ? '/' : char(std::tolower(uint8_t(ch)));
+    size_t at = low.find("resources/city/");
+    if (at == std::string::npos) return;
+    std::string leaf = low.substr(at + 15);
+    for (const auto& def : kMc2Cities) {
+        std::string prefix = std::string(def.name) + "_";
+        if (leaf.compare(0, prefix.size(), prefix) != 0) continue;
+        std::string rest = leaf.substr(prefix.size());  // "<time>_<weather>", nothing after
+        size_t us = rest.find('_');
+        if (us == std::string::npos) return;
+        std::string tod = rest.substr(0, us), weather = rest.substr(us + 1);
+        if (weather != "clear" && weather != "cloudy" && weather != "rainy") return;
+        if (tod == "noon" || tod == "day") tod = "dawn";  // MC2 has no day: its brightest time
+        if (tod != "dawn" && tod != "dusk" && tod != "midnight") return;
+        std::string now = tod + "_" + weather;
+        std::lock_guard<std::mutex> lock(g_mc2_conditions_mutex);
+        if (g_mc2_conditions != now) LOGE("MC2 city: conditions %s -> %s (from %s)", g_mc2_conditions.c_str(), now.c_str(), resource);
+        g_mc2_conditions = now;
+        return;
+    }
+}
 std::atomic<float> g_eye[3];          // the camera of the last draw, for the test teleport
 constexpr uint32_t kWhite = 0, kBlack = 1;  // textures made here
 
@@ -609,15 +649,19 @@ SamplerState sm : register(s0);
 struct V { float3 p : POSITION; float4 c : COLOR; float2 uv : TEXCOORD0; float2 uv2 : TEXCOORD1; };
 struct P { float4 p : SV_Position; float4 c : COLOR; float2 uv : TEXCOORD0; float2 uv2 : TEXCOORD1; float d : TEXCOORD2; };
 P vs(V v) {
-    P o; o.p = mul(float4(v.p, 1), vp); o.c = v.c; o.uv = v.uv; o.uv2 = v.uv2; o.d = distance(v.p, cam.xyz); return o;
+    P o; o.p = mul(float4(v.p, 1), vp); o.c = v.c; o.uv = v.uv; o.uv2 = v.uv2; o.d = distance(v.p, cam.xyz);
+    if (fog.z < 0.5) o.p.z = o.p.w * 0.99995;  // the sky sits at the far depth
+    return o;
 }
 float4 ps(P i) : SV_Target {
     float4 t = tex.Sample(sm, i.uv);
-    clip(t.a - 0.5);
+    // fog.z: 1 the city (cut-outs clip), 0 the sky dome (opaque), -1 a cloud layer (blended by its alpha)
+    if (fog.z > 0.5) clip(t.a - 0.5);
     // MC2's baked lighting times the texture, its lit windows added
     float3 c = t.rgb * i.c.rgb * cam.w + layer.Sample(sm, i.uv2).rgb;
     float f = min(saturate((i.d - fog.x) / max(fog.y - fog.x, 1)), fog_color.w);
-    return float4(lerp(c, fog_color.rgb, f), 1);
+    // the frame's alpha is MC3's glow mask (its HDR glow and blends read it): the city leaves it at fog.w, not 1
+    return float4(lerp(c, fog_color.rgb, f), fog.z < -0.5 ? t.a : (fog.z > 0.5 ? fog.w : 1));
 }
 )";
 constexpr uint32_t kConstants = 28;
@@ -636,9 +680,19 @@ class Mc2City final : public gpu::Extension {
 public:
     explicit Mc2City(fs::path root) : root_(std::move(root)) {
         const char* t = std::getenv("MC3_MC2_TIME");
-        time_ = t && *t ? t : "midnight_clear";
+        env_time_ = t && *t ? t : "";  // forces one time and weather; otherwise MC3's own, see Mc2NoteConditions
+        time_ = env_time_.empty() ? "midnight_clear" : env_time_;
         light_ = EnvFloat("MC3_MC2_LIGHT", 1.0f);
         lod_distance_ = EnvFloat("MC3_MC2_LOD", 150.0f);
+        alpha_ = EnvFloat("MC3_MC2_ALPHA", 0.0f);
+        sky_off_ = EnvFloat("MC3_MC2_SKY", 1.0f) == 0.0f;  // 0: MC3's own sky, as before
+    }
+
+    // MC3 draws its own sky first in the frame (vertex program B01056C1, tristrips, depth tested without writing): once
+    // MC2's is on screen, MC3's would cover it wherever nothing nearer was drawn, so the main scene's goes. The reflection
+    // maps and the other targets keep theirs.
+    bool SkipDraw(const gpu::State& s, const gpu::Target* rt) override {
+        return sky_on_.load(std::memory_order_relaxed) && s.vs_handle == 0xB01056C1 && rt && rt->gw >= 640 && ActiveMc2City() >= 0;
     }
 
     void HostDraw(gpu::Context& cx, const gpu::State& s, gpu::Target* rt, gpu::Target* ds, uint32_t id) override {
@@ -648,13 +702,18 @@ public:
         // the city went off (back in the frontend) and on again: announce its first draw again
         if (!g_mc2_city_first_draw_ready.load(std::memory_order_acquire)) logged_ = false;
         int st = state_.load(std::memory_order_acquire);
-        if (st != 1 && loaded_city_ != want) {
+        std::string want_time = env_time_.empty() ? Mc2Conditions() : env_time_;
+        if (want_time.empty()) want_time = "midnight_clear";
+        if (st != 1 && (loaded_city_ != want || loaded_time_ != want_time)) {
+            time_ = loaded_time_ = want_time;
             if (vb_) cx.Release(vb_), vb_.Reset();
             if (ib_) cx.Release(ib_), ib_.Reset();
             if (heap_) old_heaps_.push_back(heap_), heap_.Reset();  // may still be in flight
             for (auto& t : tex_) if (t) cx.Release(t);
             tex_.clear();
             city_ = City{};
+            sky_[0] = sky_[1] = sky_[2] = {};
+            sky_on_.store(false, std::memory_order_relaxed);
             loaded_city_ = want;
             logged_ = false;
             state_.store(0, std::memory_order_release);
@@ -680,7 +739,7 @@ public:
         k[16] = eye[0], k[17] = eye[1], k[18] = eye[2], k[19] = light_;
         for (int i = 0; i < 3; i++) g_eye[i].store(eye[i], std::memory_order_relaxed);
         k[20] = fog_.color[0], k[21] = fog_.color[1], k[22] = fog_.color[2], k[23] = fog_.clamp;
-        k[24] = fog_.start, k[25] = fog_.end;
+        k[24] = fog_.start, k[25] = fog_.end, k[26] = 1.0f, k[27] = alpha_;
         if (!logged_) {
             logged_ = true;
             g_mc2_city_first_draw_ready.store(true, std::memory_order_release);
@@ -729,7 +788,41 @@ public:
             g.ptr += uint64_t(index) * inc_;
             cl->SetGraphicsRootDescriptorTable(param, g);
         };
-        uint32_t drawn = 0, distant = 0, current = ~0u, current_layer = ~0u;
+        uint32_t current = ~0u, current_layer = ~0u;
+        // MC2's sky first, around the eye (the view without its translation), at the far depth and without fog; MC3's own
+        // sky (San Diego's, whatever the time) is dropped in SkipDraw; the cloud layers blend over the dome by their alpha
+        if (pso_sky_ && !sky_off_ && (sky_[0].count || sky_[1].count || sky_[2].count)) {
+            float sky_view[16], sky[kConstants];
+            std::memcpy(sky_view, view, sizeof(sky_view));
+            sky_view[12] = sky_view[13] = sky_view[14] = 0.0f;
+            std::memcpy(sky, k, sizeof(sky));
+            MatMul(sky_view, s.transforms[3].data(), sky);
+            sky[16] = sky[17] = sky[18] = 0.0f;
+            sky[23] = 0.0f;  // no fog
+            if (const char* dbg = std::getenv("MC3_MC2_SKYDEBUG")) sky[19] = std::strtof(dbg, nullptr);  // scales the sky: a check
+            static bool sky_logged = false;
+            if (!sky_logged) {
+                sky_logged = true;
+                LOGE("MC2 city: sky first draw, fill %u dome %u clouds %u batches, depth %s", sky_[0].count, sky_[1].count, sky_[2].count, ds ? "yes" : "no");
+            }
+            if (ds) cl->SetPipelineState(pso_sky_.Get());
+            for (int layer_kind = 0; layer_kind < 3; layer_kind++) {
+                sky[26] = layer_kind == 2 ? -1.0f : 0.0f;
+                cl->SetGraphicsRoot32BitConstants(0, kConstants, sky, 0);
+                const Range& r = sky_[layer_kind];
+                for (uint32_t b = r.first; b < r.first + r.count; b++) {
+                    const Batch& bt = city_.batches[b];
+                    if (bt.texture != current) table(1, current = bt.texture);
+                    if (bt.layer != current_layer) table(2, current_layer = bt.layer);
+                    cl->DrawIndexedInstanced(bt.count, 1, bt.first, 0, 0);
+                }
+            }
+            cl->SetPipelineState(ds ? pso_depth_.Get() : pso_.Get());
+            cl->SetGraphicsRoot32BitConstants(0, kConstants, k, 0);
+            current = current_layer = ~0u;
+            sky_on_.store(true, std::memory_order_relaxed);
+        }
+        uint32_t drawn = 0, distant = 0;
         for (const Object& o : city_.objects) {
             bool in = true;
             for (auto& p : planes)
@@ -883,6 +976,59 @@ private:
             }
             add(it->second, in.type + "_", in.owner + "_" + in.type + in.extension + "_", in.m);
         }
+        // MC2's sky for this time and weather: sky_0 is the dome, any other sky_<n> a cloud layer over it
+        {
+            fs::path sky_dir = root_ / "city" / mc2_folder / time_;
+            std::vector<fs::path> skies;
+            for (auto& e : fs::directory_iterator(sky_dir, ec)) {
+                std::string n = Lower(e.path().filename().string());
+                if (n.compare(0, 4, "sky_") == 0 && e.path().extension() == ".xmod") skies.push_back(e.path());
+            }
+            std::sort(skies.begin(), skies.end());
+            // above the dome MC2 shows its clear colour (the skyhat's m_clearColor; the fog colour when there is none):
+            // a cube round the eye in that colour, behind the dome
+            {
+                float cc[4] = {fog_.color[0], fog_.color[1], fog_.color[2], 1.0f};
+                std::string text;
+                if (ReadFile(root_ / "tune" / ("skyhat_" + std::string(mc2_folder) + "_" + time_ + ".parfileio"), text)) {
+                    Tokens tk(text);
+                    for (std::string_view w = tk.Next(); !w.empty(); w = tk.Next())
+                        if (w == "m_clearColor") cc[0] = tk.Float(), cc[1] = tk.Float(), cc[2] = tk.Float();
+                }
+                Vertex cv{};
+                cv.color = Bgra(cc);
+                uint32_t vbase = uint32_t(city_.vertices.size()), ifirst = uint32_t(city_.indices.size());
+                for (int i = 0; i < 8; i++) {
+                    cv.pos[0] = i & 1 ? 200.0f : -200.0f, cv.pos[1] = i & 2 ? 200.0f : -200.0f, cv.pos[2] = i & 4 ? 200.0f : -200.0f;
+                    city_.vertices.push_back(cv);
+                }
+                static const uint32_t kCube[36] = {0, 1, 3, 0, 3, 2, 4, 5, 7, 4, 7, 6, 0, 1, 5, 0, 5, 4,
+                                                   2, 3, 7, 2, 7, 6, 0, 2, 6, 0, 6, 4, 1, 3, 7, 1, 7, 5};
+                for (uint32_t x : kCube) city_.indices.push_back(vbase + x);
+                sky_[0].first = uint32_t(city_.batches.size());
+                sky_[0].count = 1;
+                city_.batches.push_back({ifirst, 36, kWhite, kBlack});
+                LOGE("MC2 city: sky clear colour %.3f %.3f %.3f", cc[0], cc[1], cc[2]);
+            }
+            for (const fs::path& f : skies) {
+                const Part& p = ld.Model(f);
+                if (!p.ok) continue;
+                int kind = Lower(f.filename().string()) == "sky_0.xmod" ? 1 : 2;
+                ld.BeginRange();
+                uint32_t first = uint32_t(city_.batches.size());
+                float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+                ld.Append(p, nullptr, nullptr, 0, lo, hi);
+                uint32_t added = uint32_t(city_.batches.size()) - first;
+                LOGE("MC2 city: sky %s: %zu vertices, %zu indices, bounds %.1f %.1f %.1f .. %.1f %.1f %.1f, %u batches", f.filename().string().c_str(),
+                     p.vertices.size(), p.indices.size(), lo[0], lo[1], lo[2], hi[0], hi[1], hi[2], added);
+                // the layers of one kind are consecutive in the batches; a dome file precedes its clouds
+                if (!sky_[kind].count) sky_[kind].first = first;
+                sky_[kind].count += added;
+            }
+            LOGE("MC2 city: sky %s: %zu files, dome %u batches, clouds %u batches", time_.c_str(), skies.size(), sky_[1].count,
+                 sky_[2].count);
+        }
+
         city_.vertices.shrink_to_fit();
         city_.indices.shrink_to_fit();
         float secs = std::chrono::duration<float>(std::chrono::steady_clock::now() - t0).count();
@@ -1075,14 +1221,33 @@ private:
         d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
         d.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
         if (FAILED(dev->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso_depth_)))) return false;
+        // the sky: at the far depth, always passing and no clip at the far plane; a cloud layer blends by its alpha (the
+        // dome and the fill are opaque); the frame's alpha, MC3's glow mask, is left clear like the city's
+        d.DepthStencilState.DepthEnable = TRUE;  // always passes, writes the far depth (see vs) so MC3's own sky cannot cover it
+        d.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        d.RasterizerState.DepthClipEnable = FALSE;
+        auto& bl = d.BlendState.RenderTarget[0];
+        bl.BlendEnable = TRUE;
+        bl.SrcBlend = D3D12_BLEND_SRC_ALPHA, bl.DestBlend = D3D12_BLEND_INV_SRC_ALPHA, bl.BlendOp = D3D12_BLEND_OP_ADD;
+        bl.SrcBlendAlpha = D3D12_BLEND_ZERO, bl.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA, bl.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        if (HRESULT hr = dev->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso_sky_)); FAILED(hr)) {
+            LOGE("MC2 city: sky pipeline failed (%08X), no MC2 sky", unsigned(hr));
+            pso_sky_.Reset();
+        }
         pso_fmt_ = rtv;
         (void)depth;
         return true;
     }
 
     fs::path root_;
-    std::string time_;  // MC2's time of day and weather: whose cpvs and fog
-    float light_ = 1, lod_distance_ = 150;
+    std::string time_;  // MC2's time of day and weather: whose cpvs, fog and sky
+    std::string env_time_, loaded_time_;
+    float light_ = 1, lod_distance_ = 150, alpha_ = 0;  // alpha_: what the city leaves in the frame's alpha
+    Range sky_[3];  // MC2's sky in city_.batches: the clear colour cube, the dome (sky_0), the cloud layers over it
+    ComPtr<ID3D12PipelineState> pso_sky_;
+    bool sky_off_ = false;
+    std::atomic<bool> sky_on_{false};  // MC2's sky was drawn this city: MC3's own goes
     Fog fog_;
     std::atomic<int> state_{0};  // 0 not loaded, 1 loading, 2 loaded, 3 on the GPU, -1 failed
     City city_;
@@ -1184,6 +1349,7 @@ X86_FUNC(sub_002105F0) {
         uint32_t name_va = X86_MEM32(ctx.esp + 4);
         if (name_va) {
             const char* p = reinterpret_cast<const char*>(base + name_va);
+            Mc2NoteConditions(p);
             for (const auto& def : kMc2Cities) {
                 if (std::strstr(p, def.name)) {
                     std::string s(p);

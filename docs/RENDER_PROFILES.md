@@ -622,6 +622,31 @@ Not tested yet; check these first if `enhanced` looks wrong:
 - the vehicle shadow with a full-strength day light;
 - networking, split screen, the race editor, replays.
 
+## The MC2 cities in every profile (MC3-0028)
+
+With `MC3_MC2_DIR` set the host draws Los Angeles, Paris and Tokyo from the player's own Midnight Club 2 files
+(`src/game/mc2_city.cpp`). Four faults of that shared path, all seen in `legacy`, are fixed there, so every profile gets
+the fix; none of it runs without `MC3_MC2_DIR`.
+
+* **Glare.** The city wrote alpha 1 into every pixel of the frame. MC3's HDR glow and blends read the frame's alpha as
+  their mask, so the whole picture glowed (a white wash over ground and walls in the dawn Arcade Cruise). The city and the
+  sky now leave the alpha clear (`MC3_MC2_ALPHA`, default 0; `1` is the old behaviour).
+* **View distance.** MC3 draws its own sky first in the frame (vertex program `B01056C1`, depth tested, no depth write) and
+  the MC2 city after it; far buildings are covered where MC3's clouds pass the depth test, which read as a sphere round
+  the camera. The city now draws MC2's sky (`city/<city>/<time>/sky_*.xmod`, with the skyhat's `m_clearColor` as the fill
+  behind the dome) at the far depth and `Extension::SkipDraw` drops MC3's sky draws in the main scene (the reflection
+  maps keep theirs). `MC3_MC2_SKY=0` restores MC3's sky.
+* **Time and weather.** The cpvs, fog, textures and sky were `midnight_clear` whatever MC3 had chosen, so a dawn Cruise
+  (the LA cruise race says `Time dawn`, and the Arcade menu's Time Of Day / Weather change it) showed MC3's dawn sky over a
+  midnight city. The game asks for `$/resources/city/<city>_<time>_<weather>` when it loads the city; that name is now
+  the one source for the city (`conditions dawn_clear` in the log) and the city reloads when it changes. `noon` has no MC2
+  twin and uses `dawn`. `MC3_MC2_TIME=dusk_rainy` forces one.
+* **Cost.** Nothing new per frame beyond three sky batches; see `docs/PERFORMANCE.md` for the rules the extension follows.
+
+Check: `probe_arcade_traffic.py --with-mc2 --arcade-mode cruise --city "Los Angeles (MC2)"`, then read the log for
+`MC2 city: conditions`, `sky first draw` and the capture. `MC3_MC2_SKYDEBUG=<scale>` scales the sky's brightness, to
+tell a sky that is not drawn from one that is bright.
+
 ## What the boot log says
 
 ```text
