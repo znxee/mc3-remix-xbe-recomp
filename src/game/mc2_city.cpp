@@ -99,6 +99,7 @@ X86_EXTERN_FUNC(sub_00272010);        // mcRaceConfigCar::SetVehicleFromRecord
 X86_EXTERN_FUNC(sub_001398E0);        // audFrontEnd::StopMusic
 X86_EXTERN_FUNC(sub_002105F0);        // mcResourceMgr::LoadResource
 X86_EXTERN_FUNC(__imp__sub_002105F0);
+X86_EXTERN_FUNC(__imp__sub_000EEC90);
 X86_EXTERN_FUNC(sub_0002A2E0);        // mcCity::InitResourceObjects
 X86_EXTERN_FUNC(__imp__sub_0002A2E0);
 X86_EXTERN_FUNC(sub_001CD0C0);        // mcRace::CalcRaceDistances
@@ -2362,4 +2363,21 @@ X86_FUNC(sub_00277EE0) {
         return;
     }
     __imp__sub_00277EE0(ctx, base);
+}
+
+// phLevel configuration (sub_000EEC90, called from 0x2A2E0 with the world box and the capacities). The MC2 city's
+// colliders and props fill the retail 4066 nodes / 1030 active objects, so phLevel::AddActive (0x2ABD00) finds no free
+// slot for the cars, writes 0xFFFF as their id and they never get physics or AI. MC2 cities get twice the capacity.
+X86_FUNC(sub_000EEC90) {
+    if (g_enabled && ActiveMc2City() >= 0) {
+        static bool logged = false;
+        uint32_t active = X86_MEM32(ctx.esp + 0xC), nodes = X86_MEM32(ctx.esp + 0x18);
+        if (!logged) {
+            logged = true;
+            LOGE("MC2 city: phLevel capacity %u active / %u nodes -> x2", active, nodes);
+        }
+        X86_MEM32(ctx.esp + 0xC) = active * 2;
+        X86_MEM32(ctx.esp + 0x18) = nodes * 2;
+    }
+    __imp__sub_000EEC90(ctx, base);
 }
