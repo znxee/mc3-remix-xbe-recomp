@@ -153,6 +153,12 @@ int ActiveMc2City() {
     return c >= 0 ? c : (g_always ? 0 : -1);
 }
 bool LaActive() { return ActiveMc2City() >= 0; }
+// The converted MC2 _city.aib gives the AI its road graph: without it the cars' routes have two points, the
+// steering never switches on and the opponents drive straight until the route ends. MC3_MC2_AIB=0 turns it off.
+bool AibOptOut() {
+    const char* v = std::getenv("MC3_MC2_AIB");
+    return v && *v == '0';
+}
 int FindMc2CityByRecord(uint32_t rec) {
     for (int i = 0; i < 3; i++)
         if (kMc2Cities[i].record == rec) return i;
@@ -1583,7 +1589,7 @@ void Mc2LaPaths(X86Context& ctx, uint8_t* base) {
 
     // Serve loose MC2 race/career files (and optional converted _city.aib when MC3_MC2_AIB=1) from hdd/Z/mc2/
     bool want_loose = (low.find("tune/race") != std::string::npos) ||
-                      (std::getenv("MC3_MC2_AIB") && low.find("_city.aib") != std::string::npos);
+                      (!AibOptOut() && low.find("_city.aib") != std::string::npos);
     if (want_loose) {
         std::string rel = path;
         for (auto& c : rel) if (c == '/') c = '\\';
