@@ -1530,9 +1530,114 @@ void Mc2LaRegister(X86Context&, uint8_t* base) {
 bool Mc3CarPackOpen(X86Context& ctx, uint8_t* base);  // car_packs.cpp, --mc3-car-packs
 
 // 0x1A2280 Stream::Open(path, ...): every file the game opens.
+// Retail MC3 races lay the start out as a grid: lanes 3.5 m apart, rows 10.7 m apart behind the player, every pose
+// facing the player's way (measured on the San Diego .rac files). MC2's own starts hold fewer racers than a full
+// field, and online each human takes one of the Opponent slots, so a cp_ordered / cp_unordered race with fewer than
+// 7 racers on the grid gets the missing slots appended as extra Opponent entries. The game only creates the first
+// OpponentCount of them offline (checked), so the extra ones change nothing in a single-player race.
+static bool ExtendStartGrid(std::string& text) {
+    if (text.find("RaceType cp_ordered") == std::string::npos && text.find("RaceType cp_unordered") == std::string::npos)
+        return false;
+    float player[6];
+    size_t pp = text.find("PlayerPosDir");
+    if (pp == std::string::npos || sscanf(text.c_str() + pp, "PlayerPosDir %f %f %f %f %f %f", player, player + 1, player + 2,
+                                          player + 3, player + 4, player + 5) != 6)
+        return false;
+    // the Opponent blocks: the keyword at the start of a line, then the braces until they balance
+    struct Block { size_t begin, end; float pos[3]; bool racer; };
+    std::vector<Block> blocks;
+    size_t from = text.find("numOpponents");
+    if (from == std::string::npos) return false;
+    for (size_t at = from; (at = text.find("Opponent", at)) != std::string::npos;) {
+        size_t line = text.rfind('\n', at);
+        line = line == std::string::npos ? 0 : line + 1;
+        if (text.find_first_not_of(" \t", line) != at || text.compare(at, 9, "Opponent\r") != 0 && text.compare(at, 9, "Opponent\n") != 0 &&
+            text.compare(at, 9, "Opponent ") != 0) {
+            at += 8;
+            continue;
+        }
+        size_t open = text.find('{', at);
+        if (open == std::string::npos) break;
+        int depth = 0;
+        size_t end = open;
+        for (; end < text.size(); end++) {
+            if (text[end] == '{') depth++;
+            else if (text[end] == '}' && --depth == 0) break;
+        }
+        if (end >= text.size()) return false;
+        Block b{line, end + 1, {0, 0, 0}, false};
+        std::string body = text.substr(at, end - at);
+        size_t pd = body.find("PosDir");
+        if (pd == std::string::npos || sscanf(body.c_str() + pd, "PosDir %f %f %f", b.pos, b.pos + 1, b.pos + 2) != 3) return false;
+        float dx = b.pos[0] - player[0], dz = b.pos[2] - player[2];
+        b.racer = body.find("NonCompetitorAi") == std::string::npos && dx * dx + dz * dz < 40.0f * 40.0f;
+        blocks.push_back(b);
+        at = end;
+    }
+    if (blocks.empty()) return false;
+    int racers = 0;
+    for (const auto& b : blocks) racers += b.racer;
+    const int want = 7;
+    // only when every entry is a racer: with cops or props in the list the game fills the slots those leave empty with
+    // the next entries, so an extra slot could show up as a parked car
+    if (racers >= want || racers != int(blocks.size())) return false;
+
+    // the template: a racer if there is one, else the first entry made into a plain AI car
+    const Block* tpl = &blocks[0];
+    for (const auto& b : blocks) if (b.racer) { tpl = &b; break; }
+    std::string t = text.substr(tpl->begin, tpl->end - tpl->begin);
+    auto replace_line = [&](const char* key, const std::string& value) {
+        size_t k = t.find(key);
+        if (k == std::string::npos) return;
+        size_t e = t.find('\n', k);
+        t.replace(k, e == std::string::npos ? std::string::npos : e - k, std::string(key) + " " + value + " ");
+    };
+    replace_line("DisabledAtStart", "0");
+    replace_line("RespawnCop", "0");
+    for (size_t k; (k = t.find("NonCompetitorAi")) != std::string::npos;) t.erase(k, t.find('\n', k) - k + 1);
+    if (t.find("cop") != std::string::npos) replace_line("CarType", "vp_jetta_03");
+
+    float len = std::sqrt(player[3] * player[3] + player[5] * player[5]);
+    if (len < 1e-4f) return false;
+    float fx = player[3] / len, fz = player[5] / len, rx = -fz, rz = fx;
+    static const float kLane[] = {-3.5f, 3.5f, -7.0f, 0.0f, 7.0f};
+    std::vector<std::array<float, 3>> taken;
+    taken.push_back({player[0], player[1], player[2]});
+    for (const auto& b : blocks) if (b.racer) taken.push_back({b.pos[0], b.pos[1], b.pos[2]});
+    std::string extra;
+    int added = 0;
+    for (int row = 0; row < 12 && racers + added < want; row++) {
+        for (float lane : kLane) {
+            if (racers + added >= want) break;
+            float x = player[0] - fx * 10.7f * row + rx * lane, z = player[2] - fz * 10.7f * row + rz * lane;
+            bool free = true;
+            for (const auto& q : taken) if ((q[0] - x) * (q[0] - x) + (q[2] - z) * (q[2] - z) < 9.0f) free = false;
+            if (!free) continue;
+            taken.push_back({x, player[1], z});
+            char pose[160];
+            snprintf(pose, sizeof pose, "PosDir %f %f %f  %f %f %f", x, player[1], z, player[3], player[4], player[5]);
+            std::string e = t;
+            size_t k = e.find("PosDir");
+            e.replace(k, e.find('\n', k) - k, std::string(pose) + " ");
+            extra += "\n" + e;
+            added++;
+        }
+    }
+    if (!added) return false;
+    // numOpponents counts every entry; the new ones go after the last entry
+    size_t no = text.find("numOpponents");
+    int n = 0;
+    if (sscanf(text.c_str() + no, "numOpponents %d", &n) != 1) return false;
+    text.insert(blocks.back().end, extra);
+    size_t eol = text.find('\n', no);
+    text.replace(no, eol - no, "numOpponents " + std::to_string(n + added) + (text[eol - 1] == '\r' ? "\r" : ""));
+    return true;
+}
+
 // MC2 puts a nested `PreRacePath { ... }` inside an Opponent. MC3's race reader (mcRaceBase::LoadOpponents) does not
 // know that grammar, loses its place and hands the next opponents a null car: they sit at the world origin or never
-// appear. Serve a copy of the .rac without those blocks (next to it, as <name>.rac.clean) when it has any.
+// appear. Serve a copy of the .rac without those blocks (next to it, as <name>.rac.clean) when it has any, or when the
+// start grid is completed.
 static bool StripPreRacePath(const std::string& host) {
     std::ifstream in(host, std::ios::binary);
     if (!in) return false;
@@ -1559,6 +1664,7 @@ static bool StripPreRacePath(const std::string& host) {
         }
         out += line + "\n";
     }
+    if (ExtendStartGrid(out)) changed = true;
     if (!changed) return false;
     std::ofstream(host + ".clean", std::ios::binary | std::ios::trunc) << out;
     return true;
