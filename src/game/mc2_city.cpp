@@ -1530,6 +1530,40 @@ void Mc2LaRegister(X86Context&, uint8_t* base) {
 bool Mc3CarPackOpen(X86Context& ctx, uint8_t* base);  // car_packs.cpp, --mc3-car-packs
 
 // 0x1A2280 Stream::Open(path, ...): every file the game opens.
+// MC2 puts a nested `PreRacePath { ... }` inside an Opponent. MC3's race reader (mcRaceBase::LoadOpponents) does not
+// know that grammar, loses its place and hands the next opponents a null car: they sit at the world origin or never
+// appear. Serve a copy of the .rac without those blocks (next to it, as <name>.rac.clean) when it has any.
+static bool StripPreRacePath(const std::string& host) {
+    std::ifstream in(host, std::ios::binary);
+    if (!in) return false;
+    std::string line, out;
+    bool skipping = false, opened = false, changed = false;
+    int depth = 0;
+    auto trim = [](std::string v) {
+        size_t a = v.find_first_not_of(" \t\r"), b = v.find_last_not_of(" \t\r");
+        v = a == std::string::npos ? std::string() : v.substr(a, b - a + 1);
+        for (auto& c : v) c = char(std::tolower(uint8_t(c)));
+        return v;
+    };
+    while (std::getline(in, line)) {
+        if (!skipping && trim(line) == "preracepath") {
+            skipping = true, opened = false, changed = true, depth = 0;
+            continue;
+        }
+        if (skipping) {
+            int o = int(std::count(line.begin(), line.end(), '{')), c = int(std::count(line.begin(), line.end(), '}'));
+            opened = opened || o > 0;
+            depth += o - c;
+            if (opened && depth <= 0) skipping = false;
+            continue;
+        }
+        out += line + "\n";
+    }
+    if (!changed) return false;
+    std::ofstream(host + ".clean", std::ios::binary | std::ios::trunc) << out;
+    return true;
+}
+
 void Mc2LaPaths(X86Context& ctx, uint8_t* base) {
     if (Mc3CarPackOpen(ctx, base)) {  // a car pack's file, served from the cache partition
         g_saved_read_device = X86_MEM32(kReadDevice);
@@ -1587,7 +1621,7 @@ void Mc2LaPaths(X86Context& ctx, uint8_t* base) {
         return;
     }
 
-    // Serve loose MC2 race/career files (and optional converted _city.aib when MC3_MC2_AIB=1) from hdd/Z/mc2/
+    // Serve loose MC2 race/career files and the converted _city.aib (unless MC3_MC2_AIB=0) from hdd/Z/mc2/
     bool want_loose = (low.find("tune/race") != std::string::npos) ||
                       (!AibOptOut() && low.find("_city.aib") != std::string::npos);
     if (want_loose) {
@@ -1597,6 +1631,10 @@ void Mc2LaPaths(X86Context& ctx, uint8_t* base) {
         std::string host = kernel::ResolvePath(xbox, 0);
         std::error_code ec;
         if (!host.empty() && fs::is_regular_file(host, ec)) {
+            if (low.size() > 4 && low.compare(low.size() - 4, 4, ".rac") == 0 && StripPreRacePath(host)) {
+                xbox += ".clean";
+                host += ".clean";
+            }
             uint32_t slot = AllocLoosePathSlot(base, xbox);
             X86_MEM32(ctx.esp + 4) = slot;
             g_saved_read_device = X86_MEM32(kReadDevice);
