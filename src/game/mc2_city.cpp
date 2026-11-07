@@ -1346,10 +1346,51 @@ X86_FUNC(sub_001A2280) {
 // Override mcResourceMgr::LoadResource (0x2105F0) so city resource requests for MC2 cities
 // ($/resources/city/losangeles_..., paris_..., tokyo_mc2_...) redirect to San Diego ("sd") resources,
 // providing the base lighting, sky, and weather pack without returning NULL and crashing.
+// MC2 cities load San Diego's pedestrian pack (sd_peds): its graph (vertices 12 B, nodes 40 B, connections 6 B, user data 3 B, each an
+// array {ptr, u16 count, u16 capacity} at graph +4/+0xC/+0x14/+0x1C after the vtable 0x46E8A4) put pedestrians at San Diego's coordinates (y 7, inside buildings).
+// <Mc2Dir>/pedgraph/<city>.pedgraph (mc2_ped_graph.py + mc3_peds_graph.arrays: u32 nverts, nnodes, nconns, 0, then the four blobs)
+// is built from the MC2 .aib's pedestrian rails; its arrays are copied into guest memory and the root repointed (as mc3_peds_graph.py).
+// Returns true when done (installed or given up), false while the resource is not built yet (it is filled in after LoadResource returns).
+bool Mc2PatchPedGraph(uint8_t* base, uint32_t result, int city) {
+    if (!g_enabled || city < 0 || city >= 3 || std::getenv("MC3_MC2_PEDGRAPH") && std::getenv("MC3_MC2_PEDGRAPH")[0] == '0') return true;
+    fs::path file = Mc2Dir() / "pedgraph" / (std::string(kMc2Cities[city].mc2_folder) + ".pedgraph");
+    std::ifstream in(file, std::ios::binary);
+    if (!in) { LOGE("MC2 peds: no %s, San Diego's pedestrian graph stays", file.string().c_str()); return true; }
+    std::vector<char> d((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    uint32_t cnt[3];
+    if (d.size() < 16) return true;
+    std::memcpy(cnt, d.data(), 12);
+    const size_t sz[4] = {size_t(cnt[0]) * 12, size_t(cnt[1]) * 40, size_t(cnt[2]) * 6, size_t(cnt[1]) * 3};
+    if (16 + sz[0] + sz[1] + sz[2] + sz[3] != d.size() || cnt[0] > 0xFFFF || cnt[1] > 0xFFFF || cnt[2] > 0xFFFF) {
+        LOGE("MC2 peds: %s is malformed", file.string().c_str());
+        return true;
+    }
+    // the returned pointer is the mcGraph<mcCityGraphUserData> (vtable 0x46E8A4); its four arrays follow the vtable
+    const uint32_t root = (result >= 0x80000000u && mem::IsCommitted(result + 0x24) && X86_MEM32(result) == 0x46E8A4u) ? result : 0;
+    if (!root) return false;
+    LOGE("MC2 peds: graph resource at %08X, graph root %08X (%u/%u/%u)", result, root, cnt[0], cnt[1], cnt[2]);
+    const uint16_t counts[4] = {uint16_t(cnt[0]), uint16_t(cnt[1]), uint16_t(cnt[2]), uint16_t(cnt[1])};
+    const uint32_t fields[4] = {0x04, 0x0C, 0x14, 0x1C};
+    size_t off = 16;
+    for (int i = 0; i < 4; i++) {
+        uint32_t va = mem::AllocSystem(uint32_t(sz[i] + 16), 16);
+        std::memcpy(base + va, d.data() + off, sz[i]);
+        off += sz[i];
+        X86_MEM32(root + fields[i]) = va;
+        *reinterpret_cast<uint16_t*>(base + root + fields[i] + 4) = counts[i];
+        *reinterpret_cast<uint16_t*>(base + root + fields[i] + 6) = counts[i];
+    }
+    LOGE("MC2 peds: pedestrian graph of %s installed (%u vertices, %u nodes, %u connections)", kMc2Cities[city].name, cnt[0], cnt[1], cnt[2]);
+    return true;
+}
+std::atomic<uint32_t> g_pending_peds_va{0};
+std::atomic<int> g_pending_peds_city{-1};
+
 void Mc3TraceResource(const char* how, X86Context& ctx, uint8_t* base);  // car_late_load.cpp, --mc3-trace-resources
 bool Mc3Ps2CarLoad(X86Context& ctx, uint8_t* base);  // ps2_car_loader.cpp, --mc3-ps2-cars
 
 X86_FUNC(sub_002105F0) {
+    int peds_city = -1;
     Mc3TraceResource("load", ctx, base);
     if (Mc3Ps2CarLoad(ctx, base)) return;
     if (g_enabled) {
@@ -1357,6 +1398,8 @@ X86_FUNC(sub_002105F0) {
         if (name_va) {
             const char* p = reinterpret_cast<const char*>(base + name_va);
             Mc2NoteConditions(p);
+            for (int ci = 0; ci < 3; ci++)
+                if (std::strstr(p, kMc2Cities[ci].name) && std::strstr(p, "_peds")) peds_city = ci;
             for (const auto& def : kMc2Cities) {
                 if (std::strstr(p, def.name)) {
                     std::string s(p);
@@ -1373,6 +1416,10 @@ X86_FUNC(sub_002105F0) {
         }
     }
     __imp__sub_002105F0(ctx, base);
+    if (peds_city >= 0 && !Mc2PatchPedGraph(base, ctx.eax, peds_city)) {
+        g_pending_peds_va = ctx.eax;
+        g_pending_peds_city = peds_city;
+    }
 }
 
 // Override mcCity::InitResourceObjects (0x02A2E0) to guard against NULL cityMgr (0x50715C)
@@ -1828,6 +1875,7 @@ void Teleport(uint8_t* base) {
 
 bool Mc2CityDraw(X86Context& ctx, uint8_t* base) {
     if (!g_enabled || !LaActive()) return false;
+    if (int pc = g_pending_peds_city.load(); pc >= 0 && Mc2PatchPedGraph(base, g_pending_peds_va, pc)) g_pending_peds_city = -1;
     static bool f6 = false;
     bool down = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
     if (down && !f6) Teleport(base);
