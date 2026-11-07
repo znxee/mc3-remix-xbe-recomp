@@ -11,7 +11,13 @@
 // count (the packet's adjuncts) and that many B8G8R8A8 colours, one per adjunct. A material's second texture (lit
 // windows) is added with the second texture coordinates. Collision: Mc2LaBound, at the end.
 //
-// Settings, environment: MC3_MC2_DIR (on), MC3_MC2_TIME (cpvs and fog, default midnight_clear), MC3_MC2_LIGHT (scale of
+// Time and weather: the city follows what MC3 resolved for the race or cruise (Mc2NoteConditions); the cpvs, the fog and the
+// sky (city/<city>/<time>/sky_*.xmod, the skyhat's m_clearColor behind it) are MC2's for that time. MC3's own sky is not
+// drawn in the main scene (Extension::SkipDraw). The frame's alpha is MC3's glow mask, so the city and the sky leave it clear.
+//
+// Settings, environment: MC3_MC2_DIR (on), MC3_MC2_TIME (forces one time and weather, e.g. dusk_rainy; default: MC3's),
+// MC3_MC2_SKY=0 (MC3's own sky), MC3_MC2_ALPHA (what the city leaves in the frame's alpha, default 0),
+// MC3_MC2_SKYDEBUG (scales the sky's brightness), MC3_MC2_LIGHT (scale of
 // the lighting, default 1), MC3_MC2_LOD (metres to LOD 1, default 150), MC3_MC2_ALWAYS=1 (Los Angeles in place of any
 // city), MC3_MC2_TELEPORT (F6, see Teleport), MC3_MC2_TRACE (logs every file opened).
 
@@ -28,6 +34,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -92,6 +99,7 @@ X86_EXTERN_FUNC(sub_00272010);        // mcRaceConfigCar::SetVehicleFromRecord
 X86_EXTERN_FUNC(sub_001398E0);        // audFrontEnd::StopMusic
 X86_EXTERN_FUNC(sub_002105F0);        // mcResourceMgr::LoadResource
 X86_EXTERN_FUNC(__imp__sub_002105F0);
+X86_EXTERN_FUNC(__imp__sub_000EEC90);
 X86_EXTERN_FUNC(sub_0002A2E0);        // mcCity::InitResourceObjects
 X86_EXTERN_FUNC(__imp__sub_0002A2E0);
 X86_EXTERN_FUNC(sub_001CD0C0);        // mcRace::CalcRaceDistances
@@ -145,12 +153,51 @@ int ActiveMc2City() {
     return c >= 0 ? c : (g_always ? 0 : -1);
 }
 bool LaActive() { return ActiveMc2City() >= 0; }
+// The converted MC2 _city.aib gives the AI its road graph: without it the cars' routes have two points, the
+// steering never switches on and the opponents drive straight until the route ends. MC3_MC2_AIB=0 turns it off.
+bool AibOptOut() {
+    const char* v = std::getenv("MC3_MC2_AIB");
+    return v && *v == '0';
+}
 int FindMc2CityByRecord(uint32_t rec) {
     for (int i = 0; i < 3; i++)
         if (kMc2Cities[i].record == rec) return i;
     return -1;
 }
 bool IsMc2Record(uint32_t rec) { return FindMc2CityByRecord(rec) >= 0; }
+
+// MC2's time of day and weather ("dawn_clear"), as MC3 resolved them for the race or cruise: the game asks for
+// $/resources/city/<city>_<time>_<weather> when it loads the city, whatever set the time (the race's own, the Arcade
+// menu). One authority for the cpvs, the fog, the textures and the sky, so the city and MC3's own scene agree.
+std::mutex g_mc2_conditions_mutex;
+std::string g_mc2_conditions;
+std::string Mc2Conditions() {
+    std::lock_guard<std::mutex> lock(g_mc2_conditions_mutex);
+    return g_mc2_conditions;
+}
+void Mc2NoteConditions(const char* resource) {
+    std::string low(resource);
+    for (auto& ch : low) ch = ch == '\\' ? '/' : char(std::tolower(uint8_t(ch)));
+    size_t at = low.find("resources/city/");
+    if (at == std::string::npos) return;
+    std::string leaf = low.substr(at + 15);
+    for (const auto& def : kMc2Cities) {
+        std::string prefix = std::string(def.name) + "_";
+        if (leaf.compare(0, prefix.size(), prefix) != 0) continue;
+        std::string rest = leaf.substr(prefix.size());  // "<time>_<weather>", nothing after
+        size_t us = rest.find('_');
+        if (us == std::string::npos) return;
+        std::string tod = rest.substr(0, us), weather = rest.substr(us + 1);
+        if (weather != "clear" && weather != "cloudy" && weather != "rainy") return;
+        if (tod == "noon" || tod == "day") tod = "dawn";  // MC2 has no day: its brightest time
+        if (tod != "dawn" && tod != "dusk" && tod != "midnight") return;
+        std::string now = tod + "_" + weather;
+        std::lock_guard<std::mutex> lock(g_mc2_conditions_mutex);
+        if (g_mc2_conditions != now) LOGE("MC2 city: conditions %s -> %s (from %s)", g_mc2_conditions.c_str(), now.c_str(), resource);
+        g_mc2_conditions = now;
+        return;
+    }
+}
 std::atomic<float> g_eye[3];          // the camera of the last draw, for the test teleport
 constexpr uint32_t kWhite = 0, kBlack = 1;  // textures made here
 
@@ -609,15 +656,19 @@ SamplerState sm : register(s0);
 struct V { float3 p : POSITION; float4 c : COLOR; float2 uv : TEXCOORD0; float2 uv2 : TEXCOORD1; };
 struct P { float4 p : SV_Position; float4 c : COLOR; float2 uv : TEXCOORD0; float2 uv2 : TEXCOORD1; float d : TEXCOORD2; };
 P vs(V v) {
-    P o; o.p = mul(float4(v.p, 1), vp); o.c = v.c; o.uv = v.uv; o.uv2 = v.uv2; o.d = distance(v.p, cam.xyz); return o;
+    P o; o.p = mul(float4(v.p, 1), vp); o.c = v.c; o.uv = v.uv; o.uv2 = v.uv2; o.d = distance(v.p, cam.xyz);
+    if (fog.z < 0.5) o.p.z = o.p.w * 0.99995;  // the sky sits at the far depth
+    return o;
 }
 float4 ps(P i) : SV_Target {
     float4 t = tex.Sample(sm, i.uv);
-    clip(t.a - 0.5);
+    // fog.z: 1 the city (cut-outs clip), 0 the sky dome (opaque), -1 a cloud layer (blended by its alpha)
+    if (fog.z > 0.5) clip(t.a - 0.5);
     // MC2's baked lighting times the texture, its lit windows added
     float3 c = t.rgb * i.c.rgb * cam.w + layer.Sample(sm, i.uv2).rgb;
     float f = min(saturate((i.d - fog.x) / max(fog.y - fog.x, 1)), fog_color.w);
-    return float4(lerp(c, fog_color.rgb, f), 1);
+    // the frame's alpha is MC3's glow mask (its HDR glow and blends read it): the city leaves it at fog.w, not 1
+    return float4(lerp(c, fog_color.rgb, f), fog.z < -0.5 ? t.a : (fog.z > 0.5 ? fog.w : 1));
 }
 )";
 constexpr uint32_t kConstants = 28;
@@ -636,9 +687,19 @@ class Mc2City final : public gpu::Extension {
 public:
     explicit Mc2City(fs::path root) : root_(std::move(root)) {
         const char* t = std::getenv("MC3_MC2_TIME");
-        time_ = t && *t ? t : "midnight_clear";
+        env_time_ = t && *t ? t : "";  // forces one time and weather; otherwise MC3's own, see Mc2NoteConditions
+        time_ = env_time_.empty() ? "midnight_clear" : env_time_;
         light_ = EnvFloat("MC3_MC2_LIGHT", 1.0f);
         lod_distance_ = EnvFloat("MC3_MC2_LOD", 150.0f);
+        alpha_ = EnvFloat("MC3_MC2_ALPHA", 0.0f);
+        sky_off_ = EnvFloat("MC3_MC2_SKY", 1.0f) == 0.0f;  // 0: MC3's own sky, as before
+    }
+
+    // MC3 draws its own sky first in the frame (vertex program B01056C1, tristrips, depth tested without writing): once
+    // MC2's is on screen, MC3's would cover it wherever nothing nearer was drawn, so the main scene's goes. The reflection
+    // maps and the other targets keep theirs.
+    bool SkipDraw(const gpu::State& s, const gpu::Target* rt) override {
+        return sky_on_.load(std::memory_order_relaxed) && s.vs_handle == 0xB01056C1 && rt && rt->gw >= 640 && ActiveMc2City() >= 0;
     }
 
     void HostDraw(gpu::Context& cx, const gpu::State& s, gpu::Target* rt, gpu::Target* ds, uint32_t id) override {
@@ -648,13 +709,18 @@ public:
         // the city went off (back in the frontend) and on again: announce its first draw again
         if (!g_mc2_city_first_draw_ready.load(std::memory_order_acquire)) logged_ = false;
         int st = state_.load(std::memory_order_acquire);
-        if (st != 1 && loaded_city_ != want) {
+        std::string want_time = env_time_.empty() ? Mc2Conditions() : env_time_;
+        if (want_time.empty()) want_time = "midnight_clear";
+        if (st != 1 && (loaded_city_ != want || loaded_time_ != want_time)) {
+            time_ = loaded_time_ = want_time;
             if (vb_) cx.Release(vb_), vb_.Reset();
             if (ib_) cx.Release(ib_), ib_.Reset();
             if (heap_) old_heaps_.push_back(heap_), heap_.Reset();  // may still be in flight
             for (auto& t : tex_) if (t) cx.Release(t);
             tex_.clear();
             city_ = City{};
+            sky_[0] = sky_[1] = sky_[2] = {};
+            sky_on_.store(false, std::memory_order_relaxed);
             loaded_city_ = want;
             logged_ = false;
             state_.store(0, std::memory_order_release);
@@ -680,7 +746,7 @@ public:
         k[16] = eye[0], k[17] = eye[1], k[18] = eye[2], k[19] = light_;
         for (int i = 0; i < 3; i++) g_eye[i].store(eye[i], std::memory_order_relaxed);
         k[20] = fog_.color[0], k[21] = fog_.color[1], k[22] = fog_.color[2], k[23] = fog_.clamp;
-        k[24] = fog_.start, k[25] = fog_.end;
+        k[24] = fog_.start, k[25] = fog_.end, k[26] = 1.0f, k[27] = alpha_;
         if (!logged_) {
             logged_ = true;
             g_mc2_city_first_draw_ready.store(true, std::memory_order_release);
@@ -729,7 +795,41 @@ public:
             g.ptr += uint64_t(index) * inc_;
             cl->SetGraphicsRootDescriptorTable(param, g);
         };
-        uint32_t drawn = 0, distant = 0, current = ~0u, current_layer = ~0u;
+        uint32_t current = ~0u, current_layer = ~0u;
+        // MC2's sky first, around the eye (the view without its translation), at the far depth and without fog; MC3's own
+        // sky (San Diego's, whatever the time) is dropped in SkipDraw; the cloud layers blend over the dome by their alpha
+        if (pso_sky_ && !sky_off_ && (sky_[0].count || sky_[1].count || sky_[2].count)) {
+            float sky_view[16], sky[kConstants];
+            std::memcpy(sky_view, view, sizeof(sky_view));
+            sky_view[12] = sky_view[13] = sky_view[14] = 0.0f;
+            std::memcpy(sky, k, sizeof(sky));
+            MatMul(sky_view, s.transforms[3].data(), sky);
+            sky[16] = sky[17] = sky[18] = 0.0f;
+            sky[23] = 0.0f;  // no fog
+            if (const char* dbg = std::getenv("MC3_MC2_SKYDEBUG")) sky[19] = std::strtof(dbg, nullptr);  // scales the sky: a check
+            static bool sky_logged = false;
+            if (!sky_logged) {
+                sky_logged = true;
+                LOGE("MC2 city: sky first draw, fill %u dome %u clouds %u batches, depth %s", sky_[0].count, sky_[1].count, sky_[2].count, ds ? "yes" : "no");
+            }
+            if (ds) cl->SetPipelineState(pso_sky_.Get());
+            for (int layer_kind = 0; layer_kind < 3; layer_kind++) {
+                sky[26] = layer_kind == 2 ? -1.0f : 0.0f;
+                cl->SetGraphicsRoot32BitConstants(0, kConstants, sky, 0);
+                const Range& r = sky_[layer_kind];
+                for (uint32_t b = r.first; b < r.first + r.count; b++) {
+                    const Batch& bt = city_.batches[b];
+                    if (bt.texture != current) table(1, current = bt.texture);
+                    if (bt.layer != current_layer) table(2, current_layer = bt.layer);
+                    cl->DrawIndexedInstanced(bt.count, 1, bt.first, 0, 0);
+                }
+            }
+            cl->SetPipelineState(ds ? pso_depth_.Get() : pso_.Get());
+            cl->SetGraphicsRoot32BitConstants(0, kConstants, k, 0);
+            current = current_layer = ~0u;
+            sky_on_.store(true, std::memory_order_relaxed);
+        }
+        uint32_t drawn = 0, distant = 0;
         for (const Object& o : city_.objects) {
             bool in = true;
             for (auto& p : planes)
@@ -883,6 +983,59 @@ private:
             }
             add(it->second, in.type + "_", in.owner + "_" + in.type + in.extension + "_", in.m);
         }
+        // MC2's sky for this time and weather: sky_0 is the dome, any other sky_<n> a cloud layer over it
+        {
+            fs::path sky_dir = root_ / "city" / mc2_folder / time_;
+            std::vector<fs::path> skies;
+            for (auto& e : fs::directory_iterator(sky_dir, ec)) {
+                std::string n = Lower(e.path().filename().string());
+                if (n.compare(0, 4, "sky_") == 0 && e.path().extension() == ".xmod") skies.push_back(e.path());
+            }
+            std::sort(skies.begin(), skies.end());
+            // above the dome MC2 shows its clear colour (the skyhat's m_clearColor; the fog colour when there is none):
+            // a cube round the eye in that colour, behind the dome
+            {
+                float cc[4] = {fog_.color[0], fog_.color[1], fog_.color[2], 1.0f};
+                std::string text;
+                if (ReadFile(root_ / "tune" / ("skyhat_" + std::string(mc2_folder) + "_" + time_ + ".parfileio"), text)) {
+                    Tokens tk(text);
+                    for (std::string_view w = tk.Next(); !w.empty(); w = tk.Next())
+                        if (w == "m_clearColor") cc[0] = tk.Float(), cc[1] = tk.Float(), cc[2] = tk.Float();
+                }
+                Vertex cv{};
+                cv.color = Bgra(cc);
+                uint32_t vbase = uint32_t(city_.vertices.size()), ifirst = uint32_t(city_.indices.size());
+                for (int i = 0; i < 8; i++) {
+                    cv.pos[0] = i & 1 ? 200.0f : -200.0f, cv.pos[1] = i & 2 ? 200.0f : -200.0f, cv.pos[2] = i & 4 ? 200.0f : -200.0f;
+                    city_.vertices.push_back(cv);
+                }
+                static const uint32_t kCube[36] = {0, 1, 3, 0, 3, 2, 4, 5, 7, 4, 7, 6, 0, 1, 5, 0, 5, 4,
+                                                   2, 3, 7, 2, 7, 6, 0, 2, 6, 0, 6, 4, 1, 3, 7, 1, 7, 5};
+                for (uint32_t x : kCube) city_.indices.push_back(vbase + x);
+                sky_[0].first = uint32_t(city_.batches.size());
+                sky_[0].count = 1;
+                city_.batches.push_back({ifirst, 36, kWhite, kBlack});
+                LOGE("MC2 city: sky clear colour %.3f %.3f %.3f", cc[0], cc[1], cc[2]);
+            }
+            for (const fs::path& f : skies) {
+                const Part& p = ld.Model(f);
+                if (!p.ok) continue;
+                int kind = Lower(f.filename().string()) == "sky_0.xmod" ? 1 : 2;
+                ld.BeginRange();
+                uint32_t first = uint32_t(city_.batches.size());
+                float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+                ld.Append(p, nullptr, nullptr, 0, lo, hi);
+                uint32_t added = uint32_t(city_.batches.size()) - first;
+                LOGE("MC2 city: sky %s: %zu vertices, %zu indices, bounds %.1f %.1f %.1f .. %.1f %.1f %.1f, %u batches", f.filename().string().c_str(),
+                     p.vertices.size(), p.indices.size(), lo[0], lo[1], lo[2], hi[0], hi[1], hi[2], added);
+                // the layers of one kind are consecutive in the batches; a dome file precedes its clouds
+                if (!sky_[kind].count) sky_[kind].first = first;
+                sky_[kind].count += added;
+            }
+            LOGE("MC2 city: sky %s: %zu files, dome %u batches, clouds %u batches", time_.c_str(), skies.size(), sky_[1].count,
+                 sky_[2].count);
+        }
+
         city_.vertices.shrink_to_fit();
         city_.indices.shrink_to_fit();
         float secs = std::chrono::duration<float>(std::chrono::steady_clock::now() - t0).count();
@@ -1075,14 +1228,33 @@ private:
         d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
         d.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
         if (FAILED(dev->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso_depth_)))) return false;
+        // the sky: at the far depth, always passing and no clip at the far plane; a cloud layer blends by its alpha (the
+        // dome and the fill are opaque); the frame's alpha, MC3's glow mask, is left clear like the city's
+        d.DepthStencilState.DepthEnable = TRUE;  // always passes, writes the far depth (see vs) so MC3's own sky cannot cover it
+        d.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        d.RasterizerState.DepthClipEnable = FALSE;
+        auto& bl = d.BlendState.RenderTarget[0];
+        bl.BlendEnable = TRUE;
+        bl.SrcBlend = D3D12_BLEND_SRC_ALPHA, bl.DestBlend = D3D12_BLEND_INV_SRC_ALPHA, bl.BlendOp = D3D12_BLEND_OP_ADD;
+        bl.SrcBlendAlpha = D3D12_BLEND_ZERO, bl.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA, bl.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        if (HRESULT hr = dev->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso_sky_)); FAILED(hr)) {
+            LOGE("MC2 city: sky pipeline failed (%08X), no MC2 sky", unsigned(hr));
+            pso_sky_.Reset();
+        }
         pso_fmt_ = rtv;
         (void)depth;
         return true;
     }
 
     fs::path root_;
-    std::string time_;  // MC2's time of day and weather: whose cpvs and fog
-    float light_ = 1, lod_distance_ = 150;
+    std::string time_;  // MC2's time of day and weather: whose cpvs, fog and sky
+    std::string env_time_, loaded_time_;
+    float light_ = 1, lod_distance_ = 150, alpha_ = 0;  // alpha_: what the city leaves in the frame's alpha
+    Range sky_[3];  // MC2's sky in city_.batches: the clear colour cube, the dome (sky_0), the cloud layers over it
+    ComPtr<ID3D12PipelineState> pso_sky_;
+    bool sky_off_ = false;
+    std::atomic<bool> sky_on_{false};  // MC2's sky was drawn this city: MC3's own goes
     Fog fog_;
     std::atomic<int> state_{0};  // 0 not loaded, 1 loading, 2 loaded, 3 on the GPU, -1 failed
     City city_;
@@ -1174,16 +1346,60 @@ X86_FUNC(sub_001A2280) {
 // Override mcResourceMgr::LoadResource (0x2105F0) so city resource requests for MC2 cities
 // ($/resources/city/losangeles_..., paris_..., tokyo_mc2_...) redirect to San Diego ("sd") resources,
 // providing the base lighting, sky, and weather pack without returning NULL and crashing.
+// MC2 cities load San Diego's pedestrian pack (sd_peds): its graph (vertices 12 B, nodes 40 B, connections 6 B, user data 3 B, each an
+// array {ptr, u16 count, u16 capacity} at graph +4/+0xC/+0x14/+0x1C after the vtable 0x46E8A4) put pedestrians at San Diego's coordinates (y 7, inside buildings).
+// <Mc2Dir>/pedgraph/<city>.pedgraph (mc2_ped_graph.py + mc3_peds_graph.arrays: u32 nverts, nnodes, nconns, 0, then the four blobs)
+// is built from the MC2 .aib's pedestrian rails; its arrays are copied into guest memory and the root repointed (as mc3_peds_graph.py).
+// Returns true when done (installed or given up), false while the resource is not built yet (it is filled in after LoadResource returns).
+bool Mc2PatchPedGraph(uint8_t* base, uint32_t result, int city) {
+    if (!g_enabled || city < 0 || city >= 3 || std::getenv("MC3_MC2_PEDGRAPH") && std::getenv("MC3_MC2_PEDGRAPH")[0] == '0') return true;
+    fs::path file = Mc2Dir() / "pedgraph" / (std::string(kMc2Cities[city].mc2_folder) + ".pedgraph");
+    std::ifstream in(file, std::ios::binary);
+    if (!in) { LOGE("MC2 peds: no %s, San Diego's pedestrian graph stays", file.string().c_str()); return true; }
+    std::vector<char> d((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    uint32_t cnt[3];
+    if (d.size() < 16) return true;
+    std::memcpy(cnt, d.data(), 12);
+    const size_t sz[4] = {size_t(cnt[0]) * 12, size_t(cnt[1]) * 40, size_t(cnt[2]) * 6, size_t(cnt[1]) * 3};
+    if (16 + sz[0] + sz[1] + sz[2] + sz[3] != d.size() || cnt[0] > 0xFFFF || cnt[1] > 0xFFFF || cnt[2] > 0xFFFF) {
+        LOGE("MC2 peds: %s is malformed", file.string().c_str());
+        return true;
+    }
+    // the returned pointer is the mcGraph<mcCityGraphUserData> (vtable 0x46E8A4); its four arrays follow the vtable
+    const uint32_t root = (result >= 0x80000000u && mem::IsCommitted(result + 0x24) && X86_MEM32(result) == 0x46E8A4u) ? result : 0;
+    if (!root) return false;
+    LOGE("MC2 peds: graph resource at %08X, graph root %08X (%u/%u/%u)", result, root, cnt[0], cnt[1], cnt[2]);
+    const uint16_t counts[4] = {uint16_t(cnt[0]), uint16_t(cnt[1]), uint16_t(cnt[2]), uint16_t(cnt[1])};
+    const uint32_t fields[4] = {0x04, 0x0C, 0x14, 0x1C};
+    size_t off = 16;
+    for (int i = 0; i < 4; i++) {
+        uint32_t va = mem::AllocSystem(uint32_t(sz[i] + 16), 16);
+        std::memcpy(base + va, d.data() + off, sz[i]);
+        off += sz[i];
+        X86_MEM32(root + fields[i]) = va;
+        *reinterpret_cast<uint16_t*>(base + root + fields[i] + 4) = counts[i];
+        *reinterpret_cast<uint16_t*>(base + root + fields[i] + 6) = counts[i];
+    }
+    LOGE("MC2 peds: pedestrian graph of %s installed (%u vertices, %u nodes, %u connections)", kMc2Cities[city].name, cnt[0], cnt[1], cnt[2]);
+    return true;
+}
+std::atomic<uint32_t> g_pending_peds_va{0};
+std::atomic<int> g_pending_peds_city{-1};
+
 void Mc3TraceResource(const char* how, X86Context& ctx, uint8_t* base);  // car_late_load.cpp, --mc3-trace-resources
 bool Mc3Ps2CarLoad(X86Context& ctx, uint8_t* base);  // ps2_car_loader.cpp, --mc3-ps2-cars
 
 X86_FUNC(sub_002105F0) {
+    int peds_city = -1;
     Mc3TraceResource("load", ctx, base);
     if (Mc3Ps2CarLoad(ctx, base)) return;
     if (g_enabled) {
         uint32_t name_va = X86_MEM32(ctx.esp + 4);
         if (name_va) {
             const char* p = reinterpret_cast<const char*>(base + name_va);
+            Mc2NoteConditions(p);
+            for (int ci = 0; ci < 3; ci++)
+                if (std::strstr(p, kMc2Cities[ci].name) && std::strstr(p, "_peds")) peds_city = ci;
             for (const auto& def : kMc2Cities) {
                 if (std::strstr(p, def.name)) {
                     std::string s(p);
@@ -1200,6 +1416,10 @@ X86_FUNC(sub_002105F0) {
         }
     }
     __imp__sub_002105F0(ctx, base);
+    if (peds_city >= 0 && !Mc2PatchPedGraph(base, ctx.eax, peds_city)) {
+        g_pending_peds_va = ctx.eax;
+        g_pending_peds_city = peds_city;
+    }
 }
 
 // Override mcCity::InitResourceObjects (0x02A2E0) to guard against NULL cityMgr (0x50715C)
@@ -1357,6 +1577,146 @@ void Mc2LaRegister(X86Context&, uint8_t* base) {
 bool Mc3CarPackOpen(X86Context& ctx, uint8_t* base);  // car_packs.cpp, --mc3-car-packs
 
 // 0x1A2280 Stream::Open(path, ...): every file the game opens.
+// Retail MC3 races lay the start out as a grid: lanes 3.5 m apart, rows 10.7 m apart behind the player, every pose
+// facing the player's way (measured on the San Diego .rac files). MC2's own starts hold fewer racers than a full
+// field, and online each human takes one of the Opponent slots, so a cp_ordered / cp_unordered race with fewer than
+// 7 racers on the grid gets the missing slots appended as extra Opponent entries. The game only creates the first
+// OpponentCount of them offline (checked), so the extra ones change nothing in a single-player race.
+static bool ExtendStartGrid(std::string& text) {
+    if (text.find("RaceType cp_ordered") == std::string::npos && text.find("RaceType cp_unordered") == std::string::npos)
+        return false;
+    float player[6];
+    size_t pp = text.find("PlayerPosDir");
+    if (pp == std::string::npos || sscanf(text.c_str() + pp, "PlayerPosDir %f %f %f %f %f %f", player, player + 1, player + 2,
+                                          player + 3, player + 4, player + 5) != 6)
+        return false;
+    // the Opponent blocks: the keyword at the start of a line, then the braces until they balance
+    struct Block { size_t begin, end; float pos[3]; bool racer; };
+    std::vector<Block> blocks;
+    size_t from = text.find("numOpponents");
+    if (from == std::string::npos) return false;
+    for (size_t at = from; (at = text.find("Opponent", at)) != std::string::npos;) {
+        size_t line = text.rfind('\n', at);
+        line = line == std::string::npos ? 0 : line + 1;
+        if (text.find_first_not_of(" \t", line) != at || text.compare(at, 9, "Opponent\r") != 0 && text.compare(at, 9, "Opponent\n") != 0 &&
+            text.compare(at, 9, "Opponent ") != 0) {
+            at += 8;
+            continue;
+        }
+        size_t open = text.find('{', at);
+        if (open == std::string::npos) break;
+        int depth = 0;
+        size_t end = open;
+        for (; end < text.size(); end++) {
+            if (text[end] == '{') depth++;
+            else if (text[end] == '}' && --depth == 0) break;
+        }
+        if (end >= text.size()) return false;
+        Block b{line, end + 1, {0, 0, 0}, false};
+        std::string body = text.substr(at, end - at);
+        size_t pd = body.find("PosDir");
+        if (pd == std::string::npos || sscanf(body.c_str() + pd, "PosDir %f %f %f", b.pos, b.pos + 1, b.pos + 2) != 3) return false;
+        float dx = b.pos[0] - player[0], dz = b.pos[2] - player[2];
+        b.racer = body.find("NonCompetitorAi") == std::string::npos && dx * dx + dz * dz < 40.0f * 40.0f;
+        blocks.push_back(b);
+        at = end;
+    }
+    if (blocks.empty()) return false;
+    int racers = 0;
+    for (const auto& b : blocks) racers += b.racer;
+    const int want = 7;
+    // only when every entry is a racer: with cops or props in the list the game fills the slots those leave empty with
+    // the next entries, so an extra slot could show up as a parked car
+    if (racers >= want || racers != int(blocks.size())) return false;
+
+    // the template: a racer if there is one, else the first entry made into a plain AI car
+    const Block* tpl = &blocks[0];
+    for (const auto& b : blocks) if (b.racer) { tpl = &b; break; }
+    std::string t = text.substr(tpl->begin, tpl->end - tpl->begin);
+    auto replace_line = [&](const char* key, const std::string& value) {
+        size_t k = t.find(key);
+        if (k == std::string::npos) return;
+        size_t e = t.find('\n', k);
+        t.replace(k, e == std::string::npos ? std::string::npos : e - k, std::string(key) + " " + value + " ");
+    };
+    replace_line("DisabledAtStart", "0");
+    replace_line("RespawnCop", "0");
+    for (size_t k; (k = t.find("NonCompetitorAi")) != std::string::npos;) t.erase(k, t.find('\n', k) - k + 1);
+    if (t.find("cop") != std::string::npos) replace_line("CarType", "vp_jetta_03");
+
+    float len = std::sqrt(player[3] * player[3] + player[5] * player[5]);
+    if (len < 1e-4f) return false;
+    float fx = player[3] / len, fz = player[5] / len, rx = -fz, rz = fx;
+    static const float kLane[] = {-3.5f, 3.5f, -7.0f, 0.0f, 7.0f};
+    std::vector<std::array<float, 3>> taken;
+    taken.push_back({player[0], player[1], player[2]});
+    for (const auto& b : blocks) if (b.racer) taken.push_back({b.pos[0], b.pos[1], b.pos[2]});
+    std::string extra;
+    int added = 0;
+    for (int row = 0; row < 12 && racers + added < want; row++) {
+        for (float lane : kLane) {
+            if (racers + added >= want) break;
+            float x = player[0] - fx * 10.7f * row + rx * lane, z = player[2] - fz * 10.7f * row + rz * lane;
+            bool free = true;
+            for (const auto& q : taken) if ((q[0] - x) * (q[0] - x) + (q[2] - z) * (q[2] - z) < 9.0f) free = false;
+            if (!free) continue;
+            taken.push_back({x, player[1], z});
+            char pose[160];
+            snprintf(pose, sizeof pose, "PosDir %f %f %f  %f %f %f", x, player[1], z, player[3], player[4], player[5]);
+            std::string e = t;
+            size_t k = e.find("PosDir");
+            e.replace(k, e.find('\n', k) - k, std::string(pose) + " ");
+            extra += "\n" + e;
+            added++;
+        }
+    }
+    if (!added) return false;
+    // numOpponents counts every entry; the new ones go after the last entry
+    size_t no = text.find("numOpponents");
+    int n = 0;
+    if (sscanf(text.c_str() + no, "numOpponents %d", &n) != 1) return false;
+    text.insert(blocks.back().end, extra);
+    size_t eol = text.find('\n', no);
+    text.replace(no, eol - no, "numOpponents " + std::to_string(n + added) + (text[eol - 1] == '\r' ? "\r" : ""));
+    return true;
+}
+
+// MC2 puts a nested `PreRacePath { ... }` inside an Opponent. MC3's race reader (mcRaceBase::LoadOpponents) does not
+// know that grammar, loses its place and hands the next opponents a null car: they sit at the world origin or never
+// appear. Serve a copy of the .rac without those blocks (next to it, as <name>.rac.clean) when it has any, or when the
+// start grid is completed.
+static bool StripPreRacePath(const std::string& host) {
+    std::ifstream in(host, std::ios::binary);
+    if (!in) return false;
+    std::string line, out;
+    bool skipping = false, opened = false, changed = false;
+    int depth = 0;
+    auto trim = [](std::string v) {
+        size_t a = v.find_first_not_of(" \t\r"), b = v.find_last_not_of(" \t\r");
+        v = a == std::string::npos ? std::string() : v.substr(a, b - a + 1);
+        for (auto& c : v) c = char(std::tolower(uint8_t(c)));
+        return v;
+    };
+    while (std::getline(in, line)) {
+        if (!skipping && trim(line) == "preracepath") {
+            skipping = true, opened = false, changed = true, depth = 0;
+            continue;
+        }
+        if (skipping) {
+            int o = int(std::count(line.begin(), line.end(), '{')), c = int(std::count(line.begin(), line.end(), '}'));
+            opened = opened || o > 0;
+            depth += o - c;
+            if (opened && depth <= 0) skipping = false;
+            continue;
+        }
+        out += line + "\n";
+    }
+    if (ExtendStartGrid(out)) changed = true;
+    if (!changed) return false;
+    std::ofstream(host + ".clean", std::ios::binary | std::ios::trunc) << out;
+    return true;
+}
+
 void Mc2LaPaths(X86Context& ctx, uint8_t* base) {
     if (Mc3CarPackOpen(ctx, base)) {  // a car pack's file, served from the cache partition
         g_saved_read_device = X86_MEM32(kReadDevice);
@@ -1414,9 +1774,9 @@ void Mc2LaPaths(X86Context& ctx, uint8_t* base) {
         return;
     }
 
-    // Serve loose MC2 race/career files (and optional converted _city.aib when MC3_MC2_AIB=1) from hdd/Z/mc2/
+    // Serve loose MC2 race/career files and the converted _city.aib (unless MC3_MC2_AIB=0) from hdd/Z/mc2/
     bool want_loose = (low.find("tune/race") != std::string::npos) ||
-                      (std::getenv("MC3_MC2_AIB") && low.find("_city.aib") != std::string::npos);
+                      (!AibOptOut() && low.find("_city.aib") != std::string::npos);
     if (want_loose) {
         std::string rel = path;
         for (auto& c : rel) if (c == '/') c = '\\';
@@ -1424,6 +1784,10 @@ void Mc2LaPaths(X86Context& ctx, uint8_t* base) {
         std::string host = kernel::ResolvePath(xbox, 0);
         std::error_code ec;
         if (!host.empty() && fs::is_regular_file(host, ec)) {
+            if (low.size() > 4 && low.compare(low.size() - 4, 4, ".rac") == 0 && StripPreRacePath(host)) {
+                xbox += ".clean";
+                host += ".clean";
+            }
             uint32_t slot = AllocLoosePathSlot(base, xbox);
             X86_MEM32(ctx.esp + 4) = slot;
             g_saved_read_device = X86_MEM32(kReadDevice);
@@ -1511,6 +1875,7 @@ void Teleport(uint8_t* base) {
 
 bool Mc2CityDraw(X86Context& ctx, uint8_t* base) {
     if (!g_enabled || !LaActive()) return false;
+    if (int pc = g_pending_peds_city.load(); pc >= 0 && Mc2PatchPedGraph(base, g_pending_peds_va, pc)) g_pending_peds_city = -1;
     static bool f6 = false;
     bool down = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
     if (down && !f6) Teleport(base);
@@ -1520,8 +1885,15 @@ bool Mc2CityDraw(X86Context& ctx, uint8_t* base) {
     return true;
 }
 
+// mcCullableMgr::Render walks 18 cullable classes (array at 0x507104). Hidden while an MC2 city is drawn by the host: 2/3 city
+// models, 4 props (the host draws MC2's), 6/7 trains (San Diego's tracks). 5 (aiAmbientClass, traffic) and 8 (mcCreatureCullableClass,
+// pedestrians) must stay: hiding them (old range 2..8) left MC2 cities with no ambient traffic or pedestrians drawn.
+// MC3_MC2_HIDE_ACTORS=1 brings the old 2..8 range back.
 bool Mc2CityHideList(X86Context& ctx, uint8_t*) {
-    return g_enabled && LaActive() && (ctx.edi >= 2 && ctx.edi <= 8);
+    if (!g_enabled || !LaActive()) return false;
+    static const bool hide_actors = std::getenv("MC3_MC2_HIDE_ACTORS") != nullptr;
+    if (hide_actors) return ctx.edi >= 2 && ctx.edi <= 8;
+    return (ctx.edi >= 2 && ctx.edi <= 4) || ctx.edi == 6 || ctx.edi == 7;
 }
 
 namespace {
@@ -2196,4 +2568,21 @@ X86_FUNC(sub_00277EE0) {
         return;
     }
     __imp__sub_00277EE0(ctx, base);
+}
+
+// phLevel configuration (sub_000EEC90, called from 0x2A2E0 with the world box and the capacities). The MC2 city's
+// colliders and props fill the retail 4066 nodes / 1030 active objects, so phLevel::AddActive (0x2ABD00) finds no free
+// slot for the cars, writes 0xFFFF as their id and they never get physics or AI. MC2 cities get twice the capacity.
+X86_FUNC(sub_000EEC90) {
+    if (g_enabled && ActiveMc2City() >= 0) {
+        static bool logged = false;
+        uint32_t active = X86_MEM32(ctx.esp + 0xC), nodes = X86_MEM32(ctx.esp + 0x18);
+        if (!logged) {
+            logged = true;
+            LOGE("MC2 city: phLevel capacity %u active / %u nodes -> x2", active, nodes);
+        }
+        X86_MEM32(ctx.esp + 0xC) = active * 2;
+        X86_MEM32(ctx.esp + 0x18) = nodes * 2;
+    }
+    __imp__sub_000EEC90(ctx, base);
 }

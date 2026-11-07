@@ -8,6 +8,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <cwchar>
 #include <string>
 #include <vector>
@@ -380,7 +381,79 @@ void FollowTraffic(Clock::time_point now) {
     }
     AimCameras(base, car + 0x10);
 }
+
+// --mc3-actor-follow[=seconds] [--mc3-actor-kind=car|ped]: the game's player cameras follow the ambient traffic (aiAmbientVehicle,
+// vtable 0x44D120, Matrix34 at +0x10) or the pedestrians (mcCreature, first vtable 0x46E990, position at +0x108) in turn, so what
+// they do (and whether they are drawn) can be watched. F9 = next, F10 = switch car/pedestrian. The cameras follow a scratch
+// Matrix34 copied from the actor every frame (pedestrians have none of their own). Actors are rescanned about once a second.
+bool g_actor_follow = false;
+bool g_actor_ped = false;
+float g_actor_seconds = 6.0f;
+uint32_t g_actor_index = 0;
+Clock::time_point g_actor_since, g_actor_scan;
+std::vector<uint32_t> g_actors;
+uint32_t g_actor_proxy = 0;
+float g_actor_last[3] = {};
+float g_actor_yaw = 0.0f;
+
+void FollowActors(Clock::time_point now) {
+    uint8_t* base = mem::Base();
+    const uint32_t player = PlayerMatrixFromGame();
+    if (!base || !player) {
+        ReleaseCameras(base);
+        return;
+    }
+    if (g_camera_slots.empty()) FindCameraSlots(base, player);
+    if (!g_actor_proxy) g_actor_proxy = mem::AllocSystem(64, 16);
+    const bool ped = g_actor_ped;
+    const uint32_t kind_vt = ped ? 0x46E990u : 0x44D120u;
+    const uint32_t pos_off = ped ? 0x108u : 0x34u;
+    if (now - g_actor_scan > std::chrono::seconds(1)) {
+        g_actor_scan = now;
+        g_actors.clear();
+        for (uint32_t va = 0x80000010u; va < mem::PhysicalEnd() - 0x400; va += 4) {
+            if (*reinterpret_cast<const uint32_t*>(base + va) != kind_vt) continue;
+            const float* p = reinterpret_cast<const float*>(base + va + pos_off);
+            if (std::isfinite(p[0]) && std::isfinite(p[2]) && std::fabs(p[0]) + std::fabs(p[2]) > 1.0f &&
+                std::fabs(p[0]) < 20000.0f && std::fabs(p[2]) < 20000.0f)
+                g_actors.push_back(va);
+        }
+    }
+    if (g_actors.empty()) return;
+    if (std::chrono::duration<float>(now - g_actor_since).count() >= g_actor_seconds || Pressed(VK_F9)) {
+        ++g_actor_index;
+        g_actor_since = now;
+    }
+    if (Pressed(VK_F10)) g_actor_ped = !g_actor_ped, g_actors.clear(), g_actor_index = 0;
+    if (g_actors.empty()) return;
+    const uint32_t actor = g_actors[g_actor_index % g_actors.size()];
+    const float* p = reinterpret_cast<const float*>(base + actor + pos_off);
+    float* m = reinterpret_cast<float*>(base + g_actor_proxy);
+    if (ped) {
+        // heading from the last movement (the creature's own orientation is not decoded)
+        const float dx = p[0] - g_actor_last[0], dz = p[2] - g_actor_last[2];
+        if (dx * dx + dz * dz > 1e-4f) g_actor_yaw = std::atan2(dx, dz);
+        const float c = std::cos(g_actor_yaw), sn = std::sin(g_actor_yaw);
+        const float rot[9] = {c, 0, -sn, 0, 1, 0, sn, 0, c};
+        std::memcpy(m, rot, sizeof rot);
+        m[9] = p[0]; m[10] = p[1] + 0.9f; m[11] = p[2];
+        g_actor_last[0] = p[0]; g_actor_last[1] = p[1]; g_actor_last[2] = p[2];
+    } else {
+        std::memcpy(m, base + actor + 0x10, 48);
+    }
+    static uint32_t reported = 0;
+    if (reported != actor) {
+        reported = actor;
+        LOGE("MC3 debug: following %s #%u of %zu at %08X pos=%.1f,%.1f,%.1f", ped ? "pedestrian" : "traffic car",
+             g_actor_index % uint32_t(g_actors.size()), g_actors.size(), actor, p[0], p[1], p[2]);
+    }
+    AimCameras(base, g_actor_proxy);
+}
 }  // namespace
+
+uint32_t Mc3DebugPlayerMatrix() {
+    return PlayerMatrixFromGame();
+}
 
 uint32_t Mc3DebugFindVehicleMatrix(uint32_t root, uint32_t* first_offset,
                                    uint32_t* second_offset) {
@@ -509,6 +582,10 @@ void Mc3DebugInit() {
     g_ai_follow = Mc3DebugHasArg(L"--mc3-ai-follow");
     g_camera_speed = std::clamp(FloatArg(L"--mc3-camera-speed", 30.0f), 1.0f, 500.0f);
     g_follow_seconds = std::clamp(FloatArg(L"--mc3-ai-follow", 8.0f), 1.0f, 120.0f);
+    g_actor_follow = Mc3DebugHasArg(L"--mc3-actor-follow");
+    g_actor_seconds = std::clamp(FloatArg(L"--mc3-actor-follow", 6.0f), 1.0f, 120.0f);
+    if (const wchar_t* kind = Mc3DebugArg(L"--mc3-actor-kind")) g_actor_ped = std::wcsncmp(kind, L"ped", 3) == 0;
+    g_actor_since = g_actor_scan = Clock::now();
     g_traffic_follow = Mc3DebugHasArg(L"--mc3-traffic-follow");
     g_traffic_seconds = std::clamp(FloatArg(L"--mc3-traffic-follow", 6.0f), 1.0f, 120.0f);
     g_traffic_index = uint32_t(std::clamp(FloatArg(L"--mc3-traffic-follow-from", 18.0f), 0.0f, 511.0f));
@@ -539,6 +616,10 @@ void Mc3DebugTransform(uint32_t type, float* matrix) {
         LOGE("MC3 debug: AI spectator %s", g_ai_follow ? "ON" : "OFF");
     }
     if (g_freecam) FreeCamera(matrix, dt);
+    else if (g_actor_follow) {
+        FromView(matrix);
+        FollowActors(now);
+    }
     else if (g_traffic_follow) {
         FromView(matrix);
         FollowTraffic(now);

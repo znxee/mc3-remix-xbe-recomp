@@ -92,6 +92,8 @@ public:
     // Backend::Host: the game's own drawing at that point of the title's, into rt and ds (either may be null) as
     // bound; the extension may set its own heaps and root signature, the renderer restores its own after
     virtual void HostDraw(Context&, const State&, Target* /*rt*/, Target* /*ds*/, uint32_t /*id*/) {}
+    // a title draw the extension replaced by its own (HostDraw drew in its place): true drops it; rt as bound
+    virtual bool SkipDraw(const State&, const Target* /*rt*/) { return false; }
 };
 
 inline std::unique_ptr<Extension> g_extension;

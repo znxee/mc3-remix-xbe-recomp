@@ -4800,6 +4800,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         const bool rebind = ext_->Bound(*this, s, bound_rt_, bound_ds_, a.pretransformed);
         ExtensionDone();
         if (rebind && !BindTargets(s)) return;
+        if (ext_->SkipDraw(s, bound_rt_)) return;
     }
 
     // vertex shader
