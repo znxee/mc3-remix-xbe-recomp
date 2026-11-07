@@ -408,7 +408,7 @@ void FollowActors(Clock::time_point now) {
     const bool ped = g_actor_ped;
     const uint32_t kind_vt = ped ? 0x46E990u : 0x44D120u;
     const uint32_t pos_off = ped ? 0x108u : 0x34u;
-    if (g_actors.empty() || now - g_actor_scan > std::chrono::seconds(1)) {
+    if (now - g_actor_scan > std::chrono::seconds(1)) {
         g_actor_scan = now;
         g_actors.clear();
         for (uint32_t va = 0x80000010u; va < mem::PhysicalEnd() - 0x400; va += 4) {
