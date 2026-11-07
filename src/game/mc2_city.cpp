@@ -1837,8 +1837,15 @@ bool Mc2CityDraw(X86Context& ctx, uint8_t* base) {
     return true;
 }
 
+// mcCullableMgr::Render walks 18 cullable classes (array at 0x507104). Hidden while an MC2 city is drawn by the host: 2/3 city
+// models, 4 props (the host draws MC2's), 6/7 trains (San Diego's tracks). 5 (aiAmbientClass, traffic) and 8 (mcCreatureCullableClass,
+// pedestrians) must stay: hiding them (old range 2..8) left MC2 cities with no ambient traffic or pedestrians drawn.
+// MC3_MC2_HIDE_ACTORS=1 brings the old 2..8 range back.
 bool Mc2CityHideList(X86Context& ctx, uint8_t*) {
-    return g_enabled && LaActive() && (ctx.edi >= 2 && ctx.edi <= 8);
+    if (!g_enabled || !LaActive()) return false;
+    static const bool hide_actors = std::getenv("MC3_MC2_HIDE_ACTORS") != nullptr;
+    if (hide_actors) return ctx.edi >= 2 && ctx.edi <= 8;
+    return (ctx.edi >= 2 && ctx.edi <= 4) || ctx.edi == 6 || ctx.edi == 7;
 }
 
 namespace {
