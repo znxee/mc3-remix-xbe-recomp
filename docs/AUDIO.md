@@ -39,6 +39,11 @@ to use it. The XDK 5849.17 documentation and headers are the reference for what 
   speakers at full level, 20 to 40 dB above its place in the mix, and a race mix clipped.
 * Mix bins, mix bin volumes, volume, headroom, play and loop regions, PCM and Xbox ADPCM, stream packets and their
   callbacks, as before.
+* **Stream stops.** The game stops its music with `Pause(3)` (`DSSTREAMPAUSE_PAUSENOACTIVATE`), which pauses the
+  stream, and with `FlushEx` and `DSSTREAMFLUSHEX_ENVELOPE2`, which closes it: the stream takes no more packets
+  (`GetStatus` says so) until a `Pause(0)`. The game releases the stream straight after its stop. Before, `Pause(3)`
+  resumed the stream and the flags of `FlushEx` were ignored, so the music was never released and played on into
+  the next scene (task MC3-0033).
 
 Not reproduced: filters, LFOs, the multi-function envelope (pitch and filter), envelopes on streams, HRTF filtering,
 the DSP effects image (reverb and the other sends are dropped when the voice also reaches speakers), and time stamps
@@ -60,4 +65,5 @@ Both are off by default.
 | Variable | Effect |
 | --- | --- |
 | `XBE_AUDIO_TRACE=1` | Every 10 s, `logs\mc3_xbe.log` gets how many buffers and streams exist and play, their rate range, how often each DirectSound function ran, the eight loudest voices with who made them, their volumes, bins, submix and the range of rates they played, and the voices that took the most pitch changes. |
+| `XBE_AUDIO_TRACE=1` (stream stops) | The first 400 calls to a stream's `Pause`, `Flush`, `FlushEx`, `Discontinuity` and `Release`, each with its last argument (the flags) and the guest return address: `dsound: stream <obj> FlushEx arg 5 from <addr>`. Use it to find who stops a sound. |
 | `XBE_AUDIO_DUMP=<file>` | Writes the mix, as sent to the PC, to a 16-bit 48 kHz stereo WAV file. It is a recording of the game: keep it out of the repository. |
