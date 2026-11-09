@@ -226,6 +226,19 @@ void Count(std::string_view name) {
     g_calls[name]++;
 }
 
+// XBE_AUDIO_TRACE: the guest return address of each stream stop or release, the first 400, to find who ends a stream
+// arg is the call's last argument: the pause or flush flags
+void TraceStop(std::string_view what, uint32_t obj, uint32_t arg, uint32_t from) {
+    static uint32_t logged = 0;
+    static constexpr std::string_view kStops[] = {"Pause", "Flush", "FlushEx", "Discontinuity", "Release"};
+    if (!g_trace || logged >= 400) return;
+    bool stop = false;
+    for (std::string_view s : kStops) stop = stop || s == what;
+    if (!stop) return;
+    logged++;
+    LOGR("dsound: stream %08X %.*s arg %X from %08X", obj, int(what.size()), what.data(), arg, from);
+}
+
 float Db(int32_t hundredths) { return hundredths <= -10000 ? 0.0f : std::pow(10.0f, hundredths / 2000.0f); }
 
 uint32_t FramesOf(const Voice& v, uint32_t bytes) {
@@ -1163,6 +1176,7 @@ HLE_STDCALL(IDirectSound_CreateSoundStream, 4) { return NewStream(a[1], a[2], R3
     HLE_STDCALL(CDirectSoundStream_##name, nargs) {             \
         Count("Stream_" #name);                                 \
         t_caller = R32(ctx.esp);                                \
+        TraceStop(#name, a[0], a[nargs - 1], t_caller);         \
         uint32_t r;                                             \
         std::vector<Done> flushed;                              \
         {                                                       \
