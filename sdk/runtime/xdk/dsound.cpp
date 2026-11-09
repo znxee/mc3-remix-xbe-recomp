@@ -158,6 +158,7 @@ struct Voice {
     bool playing = false, looping = false, paused = false;
     bool sync = false;  // held until IDirectSound_SynchPlayback
     bool active = false, ending = false;  // stream: took a packet since it went quiet, quiet again once they run out
+    bool closed = false;  // stream: flushed with DSSTREAMFLUSHEX_ENVELOPE2, accepts no more packets until resumed
     double pos = 0;  // frames
     double hz = 0;   // playback rate SetFrequency or SetPitch last set, 0 the format's
     // stream
@@ -224,6 +225,19 @@ void Count(std::string_view name) {
     if (!g_trace) return;
     std::lock_guard<std::mutex> lock(g_trace_lock);
     g_calls[name]++;
+}
+
+// XBE_AUDIO_TRACE: the guest return address of each stream stop or release, the first 400, to find who ends a stream
+// arg is the call's last argument: the pause or flush flags
+void TraceStop(std::string_view what, uint32_t obj, uint32_t arg, uint32_t from) {
+    static uint32_t logged = 0;
+    static constexpr std::string_view kStops[] = {"Pause", "Flush", "FlushEx", "Discontinuity", "Release"};
+    if (!g_trace || logged >= 400) return;
+    bool stop = false;
+    for (std::string_view s : kStops) stop = stop || s == what;
+    if (!stop) return;
+    logged++;
+    LOGR("dsound: stream %08X %.*s arg %X from %08X", obj, int(what.size()), what.data(), arg, from);
 }
 
 float Db(int32_t hundredths) { return hundredths <= -10000 ? 0.0f : std::pow(10.0f, hundredths / 2000.0f); }
@@ -1163,6 +1177,7 @@ HLE_STDCALL(IDirectSound_CreateSoundStream, 4) { return NewStream(a[1], a[2], R3
     HLE_STDCALL(CDirectSoundStream_##name, nargs) {             \
         Count("Stream_" #name);                                 \
         t_caller = R32(ctx.esp);                                \
+        TraceStop(#name, a[0], a[nargs - 1], t_caller);         \
         uint32_t r;                                             \
         std::vector<Done> flushed;                              \
         {                                                       \
@@ -1217,7 +1232,7 @@ STREAM(GetInfo, 2) {
     return 0;
 }
 STREAM(GetStatus, 2) {
-    W32(a[1], v.packets.size() < v.max_packets ? 1u : 0u);  // XMEDIASTATUS_ACCEPT_INPUT
+    W32(a[1], !v.closed && v.packets.size() < v.max_packets ? 1u : 0u);  // XMEDIASTATUS_ACCEPT_INPUT
     return 0;
 }
 STREAM(GetVoiceProperties, 2) {
@@ -1237,6 +1252,10 @@ STREAM(Process, 3) {
     Packet pk{R32(in), R32(in + 4), R32(in + 8), R32(in + 12), R32(in + 16)};
     if (pk.completed_ptr) W32(pk.completed_ptr, 0);
     if (pk.status_ptr) W32(pk.status_ptr, kPacketPending);
+    if (v.closed) {  // flushed for good (ENVELOPE2): the packet is dropped and completed as flushed
+        Complete(v, pk, kFlushed);
+        return 0;
+    }
     v.packets.push_back(pk);
     v.active = true;
     v.ending = false;
@@ -1251,14 +1270,20 @@ STREAM(Flush, 1) {
     FlushStream(v);
     return 0;
 }
+// DSSTREAMFLUSHEX_ENVELOPE2 (4): the stream takes no more packets once flushed. The game stops its music this way and
+// then releases the stream; GetStatus says so, and the release is what ends the feed.
 STREAM(FlushEx, 4) {
-    if (a[3] && !v.active) return 0;
+    if (a[3] & 4) v.closed = true;
+    else if (a[3] && !v.active) return 0;
     FlushStream(v);
     return 0;
 }
+// DSSTREAMPAUSE_PAUSE (1) and DSSTREAMPAUSE_PAUSENOACTIVATE (3) both pause: the game stops its music with 3.
+// Resume (0) lets a stream that was flushed for good take packets again.
 STREAM(Pause, 2) {
-    v.paused = a[1] == 1;
+    v.paused = a[1] == 1 || a[1] == 3;
     v.sync = a[1] == 2;
+    if (a[1] == 0) v.closed = false;
     return 0;
 }
 STREAM(SetVolume, 2) {
