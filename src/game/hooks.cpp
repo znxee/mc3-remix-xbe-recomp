@@ -289,6 +289,13 @@ void Mc3MainLoopPadProbe(X86Context& ctx, uint8_t* base) {
         if (g_live_ui_state->automation_buttons & (1u << 4)) current |= 0x800;
         if (g_live_ui_state->automation_a) current |= 0x40;
     }
+    // A movie's skip reads these words, and this probe owns them in that state: the controller's Start and A must
+    // come in too, the same report XInput reads, or only the keyboard skips a movie.
+    if (ctx.eax == 4 || (movie != 0 && (movie_flags & 1u) != 0)) {
+        const input::Pad pad = input::Poll(0);
+        if (pad.buttons & (1u << 4)) current |= 0x800;
+        if (pad.analog[0]) current |= 0x40;
+    }
 
     // Maintain live UI state in shared memory & logs on every tick
     UpdateLiveUiState(ctx.eax, base, current);
