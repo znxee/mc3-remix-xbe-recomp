@@ -40,13 +40,25 @@ X86_FUNC(sub_00269930) {
         // 64 MiB can reserve eight MiB for both heaps, but not ten.  The
         // foreground loader uses the first heap, so leave the background one
         // stock on that budget.  Larger guests retain headroom for both.
+        // shortcut: the Showroom loads the next car into the other heap
+        // (0x152420 toggles them), so on 64 MiB a large pack car there overruns
+        // the 3 MiB one (VIP Scion tC: 4-5 MiB in all); 128 MiB or more fits.
         const uint32_t size = mem::PhysicalSize() >= 0x8000000 ? 0x800000
                               : caller == 0x150FF0          ? 0x500000
                                                                : 0x300000;
         X86_MEM32(ctx.esp + 4) = size;
-        LOGE("MC3PS2CAR garage VehHeap %X: 3 -> %u MiB", caller, size >> 20);
+        LOGE("MC3PS2CAR garage VehHeap %X: 3 -> %u MiB%s", caller, size >> 20,
+             size == 0x300000 ? " (large pack cars in the Showroom need --mc3-guest-memory=128)" : "");
     }
     __imp__sub_00269930(ctx, base);
+}
+
+// The game's fatal error (0x325AB8 prints the formatted text, then int3s): log the text, which the trap line lacks.
+X86_EXTERN_FUNC(__imp__sub_00325AB8);
+X86_FUNC(sub_00325AB8) {
+    const uint32_t text = X86_MEM32(ctx.esp + 4);
+    if (text >= 0x10000 && mem::IsCommitted(text)) LOGE("MC3GUEST fatal: %.300s", reinterpret_cast<const char*>(base + text));
+    __imp__sub_00325AB8(ctx, base);
 }
 
 namespace {

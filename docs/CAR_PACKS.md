@@ -97,7 +97,11 @@ added by packs`, and one line per file served.
 * The garage creates two fixed 3 MiB vehicle heaps. With car packs enabled, the loader raises the foreground heap to
   5 MiB while retaining the 3 MiB background heap on a 64 MiB guest; a 128 MiB guest raises both to 8 MiB. The change
   is limited to the garage constructor's two allocation sites. This avoids the `VehHeap` overrun seen while loading
-  the VIP SRT4 `_g.pck` without making the 64 MiB allocation fail.
+  the VIP SRT4 `_g.pck` without making the 64 MiB allocation fail. The Showroom (Buy Vehicles, also Career >
+  Purchase a Vehicle on a new profile) loads the next car into the other heap, so on 64 MiB a large pack car there
+  overruns the 3 MiB one: the VIP Scion tC takes 4-5 MiB in all, and 5 + 5 MiB does not fit beside the 64 MiB game
+  heap. Browse pack cars with `--mc3-guest-memory=128` (or more), where both heaps are 8 MiB. The log names the
+  game's fatal error, e.g. `MC3GUEST fatal: FATAL: Heap VehHeap overrun (3383932 bytes requested)`.
 * The compact PPF packet decoder is used only for shared rim and exhaust page models. Regular vehicle VIF streams are
   always decoded by the VIF path; treating arbitrary VIF bytes as PPF headers skips VU batches and produces missing
   vehicle panels.
