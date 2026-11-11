@@ -806,7 +806,11 @@ HLE_STDCALL(D3DDevice_CreateVertexShader, 4) {
         for (uint32_t i = 0; i < n * 4; i++) vs->program.push_back(R32(func + 4 + i * 4));
     }
     gpu::ParseDeclaration(*vs);
+    // the XDK's vertex shader object starts with its reference count: state blocks take a reference on the shader
+    // they capture and give it back through DeleteVertexShader
     uint32_t rec = mem::AllocSystem(16, 16);
+    std::memset(HostPtr(rec), 0, 16);
+    W32(rec, 1);
     vs->handle = rec | 1;
     g_vs[vs->handle] = vs;
     W32(out, vs->handle);
@@ -818,10 +822,15 @@ HLE_STDCALL(D3DDevice_CreateVertexShader, 4) {
 HLE_STDCALL(D3DDevice_DeleteVertexShader, 1) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     auto it = g_vs.find(a[0]);
-    if (it != g_vs.end()) {
-        mem::FreeSystem(a[0] & ~1u);
-        g_vs.erase(it);
+    if (it == g_vs.end()) return 0;
+    const uint32_t rec = a[0] & ~1u;
+    const uint32_t refs = R32(rec);
+    if (refs > 1) {  // a state block still holds it
+        W32(rec, refs - 1);
+        return 0;
     }
+    mem::FreeSystem(rec);
+    g_vs.erase(it);
     return 0;
 }
 
@@ -842,6 +851,18 @@ HLE_STDCALL(D3DDevice_GetVertexShaderFunction, 3) {
 HLE_STDCALL(D3DDevice_SetVertexShader, 1) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t h = a[0];
+    // the device remembers it like the XDK's does: the shader object (the FVF shader for an FVF) and the handle.
+    // EndStateBlock (MC3 0x4169D0) captures the handle and a reference, ApplyStateBlock sets it again. Without them
+    // every D3DX effect's state block put back vertex shader 0, and an effect with no vertex shader of its own, the
+    // cars' drop shadow, then drew with no vertex inputs and was dropped (MC3-0032, 11/11)
+    if (XDK_CDevice_VertexShader != xdk::kUnknown && XDK_CDevice_VertexShaderHandle != xdk::kUnknown) {
+#if HAS_D3D_FvfShader
+        SetDev(XDK_CDevice_VertexShader, h & 1 ? h & ~1u : SYM(D3D_FvfShader));
+#else
+        SetDev(XDK_CDevice_VertexShader, h & 1 ? h & ~1u : 0);
+#endif
+        SetDev(XDK_CDevice_VertexShaderHandle, h);
+    }
     g_state.vs_handle = h;
     g_state.vs = nullptr;
     if (h & 1) {
