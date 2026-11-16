@@ -14,19 +14,38 @@ MC3's), CLUT8 textures in the PSP swizzle. A PSP-to-Xbox conversion layer would 
 for the PS2 executable (MC3-0031). Per-game Allegrex recompilers exist for other PSP games, but they need a decrypted
 executable and still return PSP-layout data. Converting to the PS2 layout reuses the whole PS2 car path instead.
 
-## What the conversion keeps
+## What comes from the MCLAR file
 
-The converter is a Python tool of the modding toolkit, not part of this repository. It takes the MCLAR car folder, a
-PS2 donor car of the same shape for the object layout, and writes a car pack with a new car name (same length as the
-donor's, so no pointer moves and the retail car stays as it is):
+The converter is a Python tool of the modding toolkit, not part of this repository. It takes the MCLAR car folder and
+writes a car pack with a new car name (same length as the PS2 car whose object layout it fills, so no pointer moves and
+the retail car stays as it is). Every value the `.psppck` holds is taken from it:
 
-| From the MCLAR car | From the PS2 donor |
-| --- | --- |
-| Geometry of the stock parts, skeleton anchors, trim texture | Object layout, shader objects, collision bounds |
-| Performance: every VehSim/VehGyro/engine/gearbox/wheel/axle/aero field by name, VehMods lists | Spotlight parameters (MCLAR has none) |
-| Audio: turbo, engine and exhaust blocks (bank, RPM ranges, distances, curves), backfire bank | Gear-shift and impact sounds |
-| Its sample banks, rebuilt as XACT wave banks (`audio\xbanks\<bank>.xwb` + `.td`) | |
-| Its `.carcfg`, `.damage`, `default.mccarcustom`, `.mcgarage`, cameras, `vehicle.lst` values | Keys MC3 has and MCLAR lacks; part-catalog indices (rims, tires, brakes, exhaust tips) |
+* geometry of every part (37 LOD slots, 31 of them paged), skeleton (113 bones), bone tags and every bone-id table of
+  `rmcCarModelType`, wheel records, nitro and exhaust points, part lists;
+* both collision bounds (physics material 1 becomes MC3's 29, the id every retail car uses);
+* the shader group, in MCLAR's order, built on MC3's shader templates (type, flags, VU passes and local names are the
+  same in all 94 retail cars), and the trim texture;
+* every tune object word (VehSim/VehGyro/engine/gearbox/wheels/axles/aero/input/damage/zone/VehMods, the material),
+  window damage, LOD distances, bounding sphere and box, occluders (none), car index;
+* the audio graph: engine, exhaust and turbo blocks, impacts, wind, tire skids, suspension, gear shifts (none),
+  backfires, warble and boost-mix fields; its sample banks, rebuilt as XACT wave banks
+  (`audio\xbanks\<bank>.xwb` + `.td`) when the Xbox `banks.dat` lacks them;
+* its `.carcfg`, `.damage`, `default.mccarcustom`, `.mcgarage`, cameras and `vehicle.lst` values.
+
+What is not in the MCLAR file comes from MC3 itself: the class layout and vtable residues, fields that hold one value in
+every retail car (spotlight parameters: MCLAR has none), and fields MC3 has and MCLAR lacks (turbo warble,
+`HighPitchCurveEngageGear`, some engine-mix words), which take the most common retail value. Text tune keys MCLAR lacks
+and the part-catalog indices (rims, tires, brakes, exhaust tips) are MC3's. Lamp lenses are MCLAR's plain shiny shader,
+so the tail lights are white, not red.
+
+Rules found on the way:
+
+* MC3's PS2 compiler puts a vptr after the data of a non-polymorphic base, MCLAR's puts it first; with MCLAR's `0xCD`
+  member padding dropped, the tune objects line up word for word.
+* A part-list choice must not name a bone that owns a resident mesh: `DeletePagedParts` deletes every LOD mesh on the
+  chosen bone when the car is released ("memMemoryAllocator::FindHeap failed").
+* A texture reference must not be shared between shader slots: the shader constructor relocates its name pointer
+  every time it runs.
 
 Car packs serve any file the game lacks, so the wave banks need no new code: the game opens a car's engine bank as
 `AUDIO\XBANKS\<bank>.td` and `.xwb` through `Stream::Open`, and the pack answers. The banks are 16-bit PCM
@@ -40,10 +59,11 @@ isolated hdd instance:
 * `vehicle.lst: 21 lines added by packs`; the car is listed in **Arcade > P1** by its pack name;
 * San Diego Cruise, 64 s with throttle, pause, **Go to Menus**: no `exception` or `KeBugCheck`; again 43 s with
   steering;
-* the PS2 loader consumed 86.56 % of the converted main file (the rest are donor objects the port leaves unused) and
-  99.35-99.91 % of the external part files;
+* every stage (collision, skeleton, shaders, LODs, tune, model, audio) was driven the same way, 64 s each, no
+  exception; the converted main file still carries about 580 KB of the PS2 car's old meshes that nothing points at;
 * the engine, exhaust and backfire banks were served from the pack and the log has no XACT error. The sound itself was
   not listened to.
 
-Not covered: MCLAR's optional parts, wide body, rims and exhaust pages, damage and collision; the car's shops (a new
-car runs the stock shops, `docs/CAR_PACKS.md`); cars other than the Corvette (the converter has one car profile).
+Not covered: choosing MCLAR's optional parts in the garage (the pack holds them, the shop menus were not driven), its
+wide body, rims and exhaust pages; the car's shops (a new car runs the stock shops, `docs/CAR_PACKS.md`); cars other than
+the Corvette (the converter has one car profile).
